@@ -89,7 +89,14 @@ def run_profile(profile_id: str, flight_s: float = 35.0, verbose: bool = True,
     base = yaml.safe_load((ROOT / "config" / "sensors.yaml").read_text())
     cfg = configure.build_config(base, configure.profile_answers(prof, base, cat, "live"), cat)
     inst = inst or sim.Installation()
-    traj = sim.Trajectory(survey_agl_m=float(prof.get("survey_agl_ft", 1000)) / 3.28084)
+    gdrv = cfg["gnss"].get("driver", "nmea")
+    has_att = daemon_main.section_enabled(cfg, "imu_ahrs") or "attitude" in daemon_main.drivers.DRIVERS[gdrv]["kinds"]
+    survey_m = float(prof.get("survey_agl_ft", 1000)) / 3.28084
+    rng = float(cfg["laser_altimeter"].get("max_range_m") or 0)
+    if rng:
+        survey_m = min(survey_m, 0.8 * rng)          # fly where the laser can see the ground
+    # Without an attitude sensor the survey legs are straight (attitude is applied in post-processing).
+    traj = sim.Trajectory(survey_agl_m=survey_m, bank_deg=20.0 if has_att else 3.0)
     work = Path(tempfile.mkdtemp(prefix=f"aerolab-vf-{profile_id}-"))
 
     devices = []
@@ -160,6 +167,7 @@ def run_profile(profile_id: str, flight_s: float = 35.0, verbose: bool = True,
             d.close()
     report["sim"] = {d.role: {"frames": d.frames, "corrupted": d.corrupted, "spikes": d.spikes,
                               "received_bytes": len(d.received)} for d in devices}
+    sent_logs = {d.role: d.sent_log for d in devices}
 
     # ---- score against the truth ----
     db = sqlite3.connect(work / "aerolab_flight.db")
@@ -170,7 +178,7 @@ def run_profile(profile_id: str, flight_s: float = 35.0, verbose: bool = True,
                       "ORDER BY unix_ts").fetchall()
     db.close()
     settle = 3.0
-    fl = [r for r in rows if r[0] - t0 > traj.park_s + settle and r[9] and r[10] and r[11]]
+    fl = [r for r in rows if r[0] - t0 > traj.park_s + settle and r[9] and r[11] and (r[10] or not has_att)]
     agl_err, agl_rel, roll_err, pitch_err, pos_err = [], [], [], [], []
     bore_samples = []
     for ts, agl, roll, pitch, yaw, lat, lon, raw, used, _lo, _io, _go, _q, alt in fl:
@@ -194,13 +202,52 @@ def run_profile(profile_id: str, flight_s: float = 35.0, verbose: bool = True,
 
     # ---- boresight fit from the flight, then re-score AGL with it ----
     off = cal_now.get("laser_offset_m") or 0.4
-    fit = calib.fit_boresight([(u, r, p, a) for u, r, p, a, _ in bore_samples], off)
+    report["has_attitude"] = has_att
+    if has_att:
+        fit = calib.fit_boresight([(u, r, p, a) for u, r, p, a, _ in bore_samples], off)
+        agl_err2 = []
+        for (u, r, p, _a, ts) in bore_samples:
+            h = daemon_main.compute_agl(u, r + fit["boresight_roll_deg"], p + fit["boresight_pitch_deg"], off)
+            agl_err2.append(h - traj.at(ts - t0)["agl"])
+        report["score"]["agl_after_boresight_m"] = stats(agl_err2)
+    else:
+        fit = None
+        report["score"]["agl_after_boresight_m"] = report["score"]["agl_m"]
     report["boresight_fit"] = fit
-    agl_err2 = []
-    for (u, r, p, _a, ts) in bore_samples:
-        h = daemon_main.compute_agl(u, r + fit["boresight_roll_deg"], p + fit["boresight_pitch_deg"], off)
-        agl_err2.append(h - traj.at(ts - t0)["agl"])
-    report["score"]["agl_after_boresight_m"] = stats(agl_err2)
+    # ---- every laser reading logged, and matched to position on GNSS time ----
+    import export_laser
+    db_path = work / "aerolab_flight.db"
+    conn = sqlite3.connect(db_path)
+    n_laser = conn.execute("SELECT COUNT(*) FROM laser_readings").fetchone()[0]
+    n_fix = conn.execute("SELECT COUNT(*) FROM gnss_fixes").fetchone()[0]
+    conn.close()
+    sent = report["sim"].get("laser", {}).get("frames", 0)
+    corrupt = report["sim"].get("laser", {}).get("corrupted", 0)
+    summ = export_laser.main(["--db", str(db_path), "--offset-m", str(off), "--out", str(work / "points.csv")])
+    import csv as _csv
+    perr = []
+    with open(work / "points.csv") as f:
+        for row in _csv.DictReader(f):
+            if row["match"] != "ok":
+                continue
+            t = float(row["gnss_time_utc"])
+            if t - t0 < traj.park_s + settle:
+                continue
+            tr = traj.at(t - t0)
+            perr.append(integrity.haversine_m(float(row["lat"]), float(row["lon"]), tr["lat"], tr["lon"]))
+    # completeness: frames sent while the daemon was reading (between its first and last logged laser reading)
+    conn = sqlite3.connect(db_path)
+    t_first, t_last = conn.execute("SELECT MIN(utc_ns), MAX(utc_ns) FROM laser_readings").fetchone()
+    conn.close()
+    window = [(t, c) for t, c in sent_logs.get("laser", []) if t_first / 1e9 <= t <= t_last / 1e9]
+    clean_sent = sum(1 for _, c in window if not c)
+    report["completeness"] = {"laser_clean_frames_sent": clean_sent, "laser_logged": n_laser,
+                              "pct": 100.0 * min(n_laser, clean_sent) / clean_sent if clean_sent else 0.0}
+    report["readings"] = {"laser_logged": n_laser, "laser_frames_sent": sent, "laser_frames_corrupted": corrupt,
+                          "gnss_fixes_logged": n_fix, "matched": summ["matched"], "not_matched": summ["not_matched"],
+                          "clock_method": summ["clock_model"]["method"],
+                          "arrival_latency_ms": summ["clock_model"]["arrival_latency_ms"]}
+    report["score"]["laser_point_position_m"] = stats(perr)
     report["truth"] = {"laser_offset_m": inst.laser_offset_m, "imu_roll_bias_deg": inst.imu_roll_bias_deg,
                        "imu_pitch_bias_deg": inst.imu_pitch_bias_deg, "boresight_roll_deg": inst.boresight_roll_deg,
                        "boresight_pitch_deg": inst.boresight_pitch_deg}
@@ -223,14 +270,30 @@ def print_report(r: dict):
     print(f"ground calibration: {r['ground_cal']['status']}")
     for i in r["ground_cal"]["items"]:
         print(f"   {i['status']:4} {i['item']}: {i['detail']}")
-    print(f"recovered: laser offset {cal.get('laser_offset_m')} m (true {t['laser_offset_m']}), "
-          f"IMU bias roll {cal['imu_roll_bias_deg']:+.3f} (true {t['imu_roll_bias_deg']:+.2f}), "
-          f"pitch {cal['imu_pitch_bias_deg']:+.3f} (true {t['imu_pitch_bias_deg']:+.2f})")
+    print(f"recovered: laser offset {cal.get('laser_offset_m')} m (true {t['laser_offset_m']})"
+          + (f", IMU bias roll {cal['imu_roll_bias_deg']:+.3f} (true {t['imu_roll_bias_deg']:+.2f}), "
+             f"pitch {cal['imu_pitch_bias_deg']:+.3f} (true {t['imu_pitch_bias_deg']:+.2f})" if r["has_attitude"] else
+             ", no attitude sensor (applied in post-processing)"))
+    rd = r["readings"]
+    print(f"readings: laser {rd['laser_logged']} logged / {rd['laser_frames_sent']} sent "
+          f"({rd['laser_frames_corrupted']} corrupted on the wire); GNSS fixes {rd['gnss_fixes_logged']}; "
+          f"matched {rd['matched']}, unmatched {rd['not_matched']}; clock: {rd['clock_method']}, "
+          f"arrival latency median {rd['arrival_latency_ms']['median']:.1f} ms")
+    c = r["completeness"]
+    print(f"completeness: {c['laser_logged']} laser readings logged of {c['laser_clean_frames_sent']} clean frames sent "
+          f"while the daemon was reading ({c['pct']:.2f}%)")
     for k in ("agl_m", "agl_pct", "roll_deg", "pitch_deg", "position_m", "geotag_last_fix_m",
-              "geotag_extrapolated_m", "agl_after_boresight_m"):
+              "geotag_extrapolated_m", "agl_after_boresight_m", "laser_point_position_m"):
         v = s[k]
         print(f"   {k:24} n={v['n']:4}  mean {v['mean']:+8.3f}  p95 {v['p95']:8.3f}  max {v['max']:8.3f}")
     b = r["boresight_fit"]
+    if b is None:
+        b = {"boresight_roll_deg": 0, "boresight_pitch_deg": 0, "pitch_fitted": False, "spread_before_m": 0,
+             "spread_after_m": 0}
+        print("boresight: not applicable without attitude")
+        h = r["health"]
+        print("health: " + "; ".join(f"{k} {v['hz']} Hz err {v['err_pct']}%" for k, v in h.items() if v["age_ms"] is not None))
+        return
     print(f"boresight fit: roll {b['boresight_roll_deg']:+.2f}° (true {t['boresight_roll_deg']:+.2f}), "
           f"pitch {b['boresight_pitch_deg']:+.2f}° ({'fitted' if b['pitch_fitted'] else 'not observable'}); "
           f"height spread {b['spread_before_m']:.2f} -> {b['spread_after_m']:.2f} m")
@@ -243,23 +306,38 @@ def print_report(r: dict):
 def markdown(reports: list[dict]) -> str:
     out = ["# Virtual flight accuracy report", "",
            "Generated by `python tools/virtual_flight.py --markdown docs/accuracy.md`.",
-           "The real daemon ran against simulated serial sensors speaking each device's protocol, with known truth.",
+           "The real daemon ran, as a separate process, against simulated serial sensors speaking each device's "
+           "protocol, with known truth.",
            "The simulated installation had deliberate errors: IMU bias (+0.8° roll, -0.5° pitch), laser offset "
            "0.62 m against 0.40 m entered by hand, laser boresight 1.0° in roll, 2% corrupted frames, 1% laser spikes, "
-           "3 cm laser noise. Flight: survey height, ±20° banks every 16 s, 55 m/s.", "",
-           "| Profile | Self-test | Ground cal | Offset found (true 0.62) | IMU bias found (true +0.80/-0.50) | "
-           "AGL p95 before boresight | Boresight found (true 1.00°) | AGL p95 after | Roll p95 | Position p95 | "
-           "Geotag p95 (last fix → extrapolated) |",
-           "|---|---|---|---|---|---|---|---|---|---|---|"]
+           "3 cm laser noise, 0.4 m GNSS noise.",
+           "Profiles with an attitude source fly ±20° banks every 16 s at 55 m/s; profiles without one (attitude in "
+           "post-processing) fly straight legs (±3°). Height is the profile's survey height, capped at 80% of the "
+           "laser's rated range.", "",
+           "Every self-test says **warn** on purpose: the aircraft had not been calibrated at boot, and for "
+           "checksummed protocols it caught the injected corrupted frames. \"AGL p95\" for attitude profiles is after "
+           "ground calibration and the boresight fit. The GRF-500 reports in 0.1 m steps, hence its 0.6 m offset. "
+           "Laser readings logged counts every reading saved against the clean frames sent while the daemon was "
+           "reading; lasers without a checksum (ILM-150-R, Riegl, generic ASCII) also log the lines corrupted on the "
+           "wire (kept out of AGL by the spike gate), so their count can exceed the clean frames.", "",
+           "| Profile | Height | Laser readings logged | Laser points p95 | Offset found (true 0.62 m) | "
+           "IMU bias found (true +0.80/-0.50°) | Boresight found (true 1.00°) | AGL p95 | Roll p95 | "
+           "Geotag p95, last fix → extrapolated |",
+           "|---|---|---|---|---|---|---|---|---|---|"]
     for r in reports:
-        s, c, b = r["score"], r["calibration"], r["boresight_fit"]
+        s, c = r["score"], r["calibration"]
+        att = r.get("has_attitude", True)
+        b = r.get("boresight_fit") or {}
+        comp = r.get("completeness", {})
         out.append(
-            f"| {r['profile']} | {r['bit']['status']} | {r['ground_cal']['status']} | {c.get('laser_offset_m')} m | "
-            f"{c['imu_roll_bias_deg']:+.2f}/{c['imu_pitch_bias_deg']:+.2f}° | "
-            f"{s['agl_m']['p95']:.2f} m ({s['agl_pct']['p95']:.2f}%) at {s['survey_agl_m']:.0f} m | "
-            f"{b['boresight_roll_deg']:+.2f}° | {s['agl_after_boresight_m']['p95']:.2f} m | "
-            f"{s['roll_deg']['p95']:.2f}° | {s['position_m']['p95']:.1f} m | "
-            f"{s['geotag_last_fix_m']['p95']:.1f} → {s['geotag_extrapolated_m']['p95']:.1f} m |")
+            f"| {r['profile']} | {s['survey_agl_m']:.0f} m | {comp.get('pct', float('nan')):.1f}% "
+            f"({comp.get('laser_logged', '?')} of {comp.get('laser_clean_frames_sent', '?')}) | "
+            f"{s['laser_point_position_m']['p95']:.2f} m | {c.get('laser_offset_m')} m | "
+            + (f"{c['imu_roll_bias_deg']:+.2f}/{c['imu_pitch_bias_deg']:+.2f}° | {b['boresight_roll_deg']:+.2f}° | "
+               if att else "no attitude sensor | n/a | ")
+            + f"{s['agl_after_boresight_m']['p95']:.2f} m ({100 * s['agl_after_boresight_m']['p95'] / s['survey_agl_m']:.2f}%) | "
+            + (f"{s['roll_deg']['p95']:.2f}° | " if att else "n/a | ")
+            + f"{s['geotag_last_fix_m']['p95']:.1f} → {s['geotag_extrapolated_m']['p95']:.1f} m |")
     out += ["", "## Self-test and calibration details", ""]
     for r in reports:
         out.append(f"### {r['profile']}")
@@ -268,6 +346,11 @@ def markdown(reports: list[dict]) -> str:
             out.append(f"- self-test **{i['status']}** {i['item']}: {i['detail']}")
         for i in r["ground_cal"]["items"]:
             out.append(f"- ground cal **{i['status']}** {i['item']}: {i['detail']}")
+        rd = r.get("readings")
+        if rd:
+            out.append(f"- readings: {rd['laser_logged']} laser, {rd['gnss_fixes_logged']} GNSS fixes; "
+                       f"{rd['matched']} laser readings matched to position, {rd['not_matched']} not; "
+                       f"clock model: {rd['clock_method']}")
         out.append("")
     return "\n".join(out)
 

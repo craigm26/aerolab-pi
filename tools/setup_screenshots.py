@@ -12,8 +12,13 @@ import pyte
 from PIL import Image, ImageDraw, ImageFont
 
 repo, outdir = sys.argv[1], sys.argv[2]
-laser_key = sys.argv[3].encode() if len(sys.argv) > 3 else b""
+laser_key = sys.argv[3].encode() if len(sys.argv) > 3 and sys.argv[3] != "-" else b""
+survey = sys.argv[4].encode() if len(sys.argv) > 4 else b""
 KEYS = [("Laser altimeter:", laser_key)]   # screen text -> keys before Enter
+if survey:
+    KEYS.append(("Planned survey height", b"\x7f" * 8 + survey))
+# Never touch real serial ports from a screenshot run: answer No to "Listen on <port>".
+STICKY = [("Listen on ", b"\t")]
 COLS, ROWS = 100, 30
 pid, fd = pty.fork()
 if pid == 0:
@@ -61,6 +66,9 @@ while True:
     for k, keys in KEYS:
         if k in text and keys:
             os.write(fd, keys); pump(0.4); KEYS.remove((k, keys)); break
+    for k, keys in STICKY:
+        if k in text:
+            os.write(fd, keys); pump(0.3)
     os.write(fd, b"\r")
     if not pump(1.0):
         break

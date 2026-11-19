@@ -165,7 +165,12 @@ def parse_pashr(text: str) -> Reading | None:
 
 
 def parse_number(text: str, unit: str = "m") -> Reading | None:
-    """First number on the line is the range. Handles '12.34', '12.34 m', 'D 0012.345'."""
+    """First number on the line is the range. Handles '12.34', '12.34 m', 'D 0012.345'.
+
+    NMEA-style sentences ($..., !...) are never ranges, even though they contain numbers.
+    """
+    if text[:1] in ("$", "!"):
+        return None
     for tok in text.replace(",", " ").split():
         tok = tok.rstrip("mM")
         try:
@@ -204,6 +209,11 @@ def parse_csv_rpy(text: str) -> Reading | None:
 # Device-specific drivers
 # ---------------------------------------------------------------------------
 
+# GPS time minus UTC. 18 s since 2017-01-01; the IERS has announced no new leap second
+# as of 2026. Used only where a device reports GPS time (VectorNav $VNINS).
+GPS_UTC_LEAP_S = 18
+
+
 def nmea_xor(body: str) -> int:
     calc = 0
     for ch in body:
@@ -235,6 +245,8 @@ def parse_vectornav(text: str) -> Reading | None:
             status = int(f[3], 16)
             yaw, pitch, roll = float(f[4]), float(f[5]), float(f[6])
             r: Reading = {"roll": roll, "pitch": pitch, "yaw": yaw % 360.0}
+            # GPS time of week -> UTC time of day (GPS is ahead of UTC by the leap seconds)
+            r["gnss_tod"] = (float(f[1]) - GPS_UTC_LEAP_S) % 86400.0
             gps_fix = bool(status & 0x4)
             mode = status & 0x3          # 0 not tracking, 1 aligning/degraded, 2 OK
             r["fix"] = 1 if (gps_fix and mode >= 1) else 0
@@ -338,6 +350,93 @@ class BNO08xRVCDriver:
         if len(self.buf) > 512:
             del self.buf[:-19]
         return out
+
+
+def fletcher8(data: bytes) -> tuple[int, int]:
+    a = b = 0
+    for x in data:
+        a = (a + x) & 0xFF
+        b = (b + a) & 0xFF
+    return a, b
+
+
+class ERBDriver:
+    """Emlid Reach Binary (ERB 0.1.0): 'E' 'R' id len(u16 LE) payload ck_a ck_b.
+
+    Checksum: 8-bit Fletcher over id, length and payload. Every message starts
+    with timeGPS (u32 ms, GPS time of week), except RTK. Used messages:
+      STAT 0x03: fixType@6 (0 none, 1 single, 2 float, 3 fix), numSV@8
+      DOPS 0x04: dopHor@10 (u16 x0.01)
+      VEL  0x05: speed@16 (u32 cm/s), heading@20 (i32 x1e-5 deg)
+      POS  0x02: lng@4 lat@12 altEl@20 altMsl@28 (doubles: deg, deg, m, m)
+    A POS reading carries the latest STAT/DOPS/VEL values. Source: ERB-0.1.0-v7.pdf.
+    """
+
+    FIX_MAP = {0: 0, 1: 1, 2: 5, 3: 4}   # ERB fixType -> NMEA GGA quality
+
+    def __init__(self, **_):
+        self.buf = bytearray()
+        self.stats = Stats()
+        self.fix, self.sats, self.hdop, self.gs, self.track = 0, 0, None, None, None
+
+    def feed(self, data: bytes) -> list[Reading]:
+        self.buf += data
+        out = []
+        while len(self.buf) >= 7:
+            if self.buf[0] != 0x45 or self.buf[1] != 0x52:
+                del self.buf[0]
+                continue
+            mid = self.buf[2]
+            n = self.buf[3] | (self.buf[4] << 8)
+            if n > 2048:
+                del self.buf[0]
+                continue
+            total = 5 + n + 2
+            if len(self.buf) < total:
+                break
+            body = bytes(self.buf[2:5 + n])
+            if fletcher8(body) != (self.buf[5 + n], self.buf[6 + n]):
+                self.stats.bad += 1
+                del self.buf[0]
+                continue
+            pl = body[3:]
+            del self.buf[:total]
+            try:
+                if mid == 0x03 and n >= 9:
+                    self.fix = self.FIX_MAP.get(pl[6], 1)
+                    self.sats = pl[8]
+                elif mid == 0x04 and n >= 12:
+                    self.hdop = struct.unpack_from("<H", pl, 10)[0] * 0.01
+                elif mid == 0x05 and n >= 24:
+                    self.gs = struct.unpack_from("<I", pl, 16)[0] / 100.0
+                    self.track = (struct.unpack_from("<i", pl, 20)[0] * 1e-5) % 360.0
+                elif mid == 0x02 and n >= 36:
+                    tow_ms = struct.unpack_from("<I", pl, 0)[0]
+                    lng, lat, alt_el, alt_msl = struct.unpack_from("<dddd", pl, 4)
+                    r: Reading = {"fix": self.fix, "sats": self.sats,
+                                  "gnss_tod": (tow_ms / 1000.0 - GPS_UTC_LEAP_S) % 86400.0}
+                    if self.hdop is not None:
+                        r["hdop"] = self.hdop
+                    if self.fix:
+                        r.update(lat=lat, lon=lng, alt_msl=alt_msl)
+                    out.append(r)
+                    if self.gs is not None:
+                        g: Reading = {"gs_ms": self.gs}
+                        if self.track is not None:
+                            g["track_deg"] = self.track
+                        out.append(g)
+                    self.stats.good += 1
+            except struct.error:
+                self.stats.bad += 1
+        if len(self.buf) > 8192:
+            del self.buf[:-7]
+        return out
+
+
+def erb_frame(mid: int, payload: bytes) -> bytes:
+    body = bytes([mid]) + struct.pack("<H", len(payload)) + payload
+    a, b = fletcher8(body)
+    return b"ER" + body + bytes([a, b])
 
 
 def crc16_xmodem(data: bytes) -> int:
@@ -486,6 +585,8 @@ DRIVERS: dict[str, dict] = {
                    "about": "BNO085/086 UART-RVC 19-byte frames"},
     "lightware_binary": {"make": lambda **o: LightWareBinaryDriver(), "kinds": ["range"],
                          "about": "LightWare binary protocol, distance message 44"},
+    "erb": {"make": lambda **o: ERBDriver(), "kinds": ["position"],
+            "about": "Emlid Reach Binary (POS, STAT, DOPS, VEL)"},
     "mavlink": {"make": lambda **o: MAVLinkDriver(), "kinds": ["position", "attitude"],
                 "about": "MAVLink ATTITUDE + GPS_RAW_INT (needs pymavlink)"},
 }

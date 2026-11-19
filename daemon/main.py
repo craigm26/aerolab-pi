@@ -33,6 +33,10 @@ import buddy as buddy_mod  # noqa: E402
 import calibration as calib  # noqa: E402
 import drivers  # noqa: E402
 import integrity as integ  # noqa: E402
+import diagnose  # noqa: E402
+import ppsclock  # noqa: E402
+import rawlog  # noqa: E402
+from supervise import Supervisor, watchdog  # noqa: E402
 
 # gpiozero works on every Pi model including the Pi 5 (RPi.GPIO does not).
 # On a laptop it is missing or has no pin factory, and triggers are simulated.
@@ -223,9 +227,29 @@ class AeroLabDaemon:
         self.db_path = self.log_dir / "aerolab_flight.db"
         self._init_db()
 
+        self.mirror_dirs = [Path(d) for d in (log_cfg.get("mirror_dirs") or [])]
+        self.readings = rawlog.ReadingLog(lambda: self.db_path, on_error=self._data_error)
+        self.raw: dict[str, rawlog.RawWriter] = {}
+        tcfg = cfg.get("timing") or {}
+        self.pps = ppsclock.PPSClock(tcfg.get("pps_device") if not sim_mode else None,
+                                     on_edge=lambda seq, a, off: self.readings.add(
+                                         "pps", (self.state.flight_id, seq, a, a - off, off)))
+        self._data_errors: dict[str, float] = {}
+
+        try:
+            self.catalog = yaml.safe_load((APP_ROOT / "config" / "hardware.yaml").read_text())
+        except (OSError, yaml.YAMLError):
+            self.catalog = None
+        self.ready: dict = {"level": "amber", "text": "Starting", "blockers": 0, "warnings": 0}
+        self.findings: list = []
         self.buddy = buddy_mod.Buddy(cfg, db_path=self.db_path)
+        self.buddy.diagnosis = lambda: diagnose.as_text(self.findings)
+        self.sup = Supervisor(report=lambda level, text: self.buddy.emit(level, text))
         if sim_mode:
-            self.buddy.configured = {"gnss": True, "laser": True, "imu": True}
+            # The simulator plays the configured hardware: no attitude sensor -> no attitude.
+            gdrv = (cfg.get("gnss") or {}).get("driver", "nmea")
+            att = section_enabled(cfg, "imu_ahrs") or "attitude" in drivers.DRIVERS.get(gdrv, {}).get("kinds", [])
+            self.buddy.configured = {"gnss": True, "laser": True, "imu": att}
         else:
             used = {"gnss": section_enabled(cfg, "gnss"),
                     "laser": section_enabled(cfg, "laser_altimeter"),
@@ -301,6 +325,41 @@ class AeroLabDaemon:
         conn.close()
         self.session_start = time.time()
 
+    def _data_error(self, msg: str):
+        """A write failed somewhere. Say so loudly, but at most once a minute per message."""
+        print(f"[data] {msg}", flush=True)
+        key = msg.split(":")[0]
+        now = time.time()
+        if now - self._data_errors.get(key, 0) > 60 and hasattr(self, "buddy"):
+            self._data_errors[key] = now
+            self.buddy.emit("alert", f"Data write problem: {msg}")
+
+    def log_dirs(self) -> list[Path]:
+        return [self.log_dir] + [d for d in self.mirror_dirs if d != self.log_dir]
+
+    def recheck_log_dir(self) -> bool:
+        """After a write error: is the SSD gone (or back)? Move logging to wherever works. True if moved."""
+        lc = self.cfg["logging"]
+        new = resolve_log_dir(lc["primary_dir"], lc["fallback_dir"], self.sim_mode)
+        if new == self.log_dir:
+            return False
+        try:
+            new.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return False
+        old = self.log_dir
+        self.log_dir = new
+        self.fallback_logging = (not self.sim_mode) and new != Path(lc["primary_dir"])
+        self.state.log_dir = str(new)
+        self.db_path = new / "aerolab_flight.db"
+        self.buddy.db_path = self.db_path
+        self._init_db()
+        for w in self.raw.values():
+            w.close()
+            w.dirs = self.log_dirs()
+        self.buddy.emit("alert" if self.fallback_logging else "info", f"Logging moved from {old} to {new}")
+        return True
+
     def new_flight(self, reason: str = "new flight") -> int:
         """Start a flight record: snapshots calibration and config so every flight is traceable."""
         conn = self._connect_db()
@@ -350,9 +409,14 @@ class AeroLabDaemon:
         s.off_nadir_deg = round(integ.off_nadir_deg(roll, pitch), 1)
         s.agl_quality = integ.agl_quality(roll, pitch, s.laser_raw_m, self.max_range_m, self.max_tilt_deg)
 
-    def apply(self, r: dict, role: str | None = None):
-        """Apply one driver reading to the state, whatever kinds it carries."""
-        now = time.time()
+    def apply(self, r: dict, role: str | None = None, ts: tuple[int, int] | None = None):
+        """Apply one driver reading to the state, whatever kinds it carries.
+
+        ts = (utc_ns, mono_ns) when the bytes were read; every laser range and
+        GNSS fix is also queued for the per-reading tables with that time.
+        """
+        utc_ns, mono_ns = ts or (time.time_ns(), time.monotonic_ns())
+        now = utc_ns / 1e9
         s = self.state
         # Monitors follow what a reading carries: a GNSS/INS feeds both GNSS and attitude.
         if "fix" in r or "lat" in r:
@@ -385,6 +449,10 @@ class AeroLabDaemon:
             if self.capture:
                 self.capture.add(lat=s.lat, lon=s.lon, alt=s.alt_msl_m, fix=s.gps_fix, sats=s.sats,
                                  hdop=s.hdop or None, clock_offset=s.gnss_time_offset_s)
+        if "fix" in r or "lat" in r:
+            self.readings.add("gnss", (s.flight_id, utc_ns, mono_ns, r.get("gnss_tod"), r.get("lat"), r.get("lon"),
+                                       r.get("alt_msl", r.get("alt_hae")), "HAE" if "alt_hae" in r else "MSL",
+                                       r.get("fix"), r.get("sats"), r.get("hdop"), r.get("gs_ms"), r.get("track_deg")))
         if "roll" in r and "pitch" in r:
             self.raw_roll, self.raw_pitch = float(r["roll"]), float(r["pitch"])
             roll, pitch = self.cal.correct_attitude(self.raw_roll, self.raw_pitch)
@@ -404,8 +472,11 @@ class AeroLabDaemon:
             s.laser_raw_m = round(rng, 3)
             if self.capture:
                 self.capture.add(laser_raw=rng)
-            if self.on_laser(rng):
+            ok = self.on_laser(rng)
+            if ok:
                 self.last_seen["laser"] = now
+            self.readings.add("laser", (s.flight_id, utc_ns, mono_ns, rng, int(ok), s.agl_m if ok else None,
+                                        s.roll_deg, s.pitch_deg))
 
     def extrapolated_position(self, now: float) -> tuple[float, float]:
         """Where the aircraft is now, not where it was at the last fix: last fix + ground speed x age."""
@@ -454,8 +525,9 @@ class AeroLabDaemon:
                             "lat": lat + rnd.gauss(0, 4e-6), "lon": lon + rnd.gauss(0, 5e-6),
                             "alt_msl": 120.0 + 1.5 + rnd.gauss(0, 0.4)}, "gnss")
                 self.apply({"gs_ms": 0.0, "track_deg": 0.0})
-                self.apply({"roll": rb + rnd.gauss(0, 0.05), "pitch": pb + rnd.gauss(0, 0.05),
-                            "yaw": 90.0}, "imu")
+                if self.buddy.configured.get("imu"):
+                    self.apply({"roll": rb + rnd.gauss(0, 0.05), "pitch": pb + rnd.gauss(0, 0.05),
+                                "yaw": 90.0}, "imu")
                 self.apply({"range_m": true_offset + rnd.gauss(0, 0.01)}, "laser")
             else:
                 roll = float(sc.get("bank_deg", 12.0)) * math.sin(t * 0.25)
@@ -468,7 +540,8 @@ class AeroLabDaemon:
                             "lat": lat, "lon": lon, "alt_msl": agl_true + 120.0 + 30.0 * math.sin(t * 0.03)},
                            "gnss")
                 self.apply({"gs_ms": gs, "track_deg": yaw})
-                self.apply({"roll": roll + rb, "pitch": pitch + pb, "yaw": yaw}, "imu")
+                if self.buddy.configured.get("imu"):
+                    self.apply({"roll": roll + rb, "pitch": pitch + pb, "yaw": yaw}, "imu")
                 if not (faults and 41.0 <= (t % 45.0)):
                     rng = (agl_true + true_offset) / (math.cos(math.radians(roll)) * math.cos(math.radians(pitch)))
                     self.apply({"range_m": rng + rnd.gauss(0, 0.03)}, "laser")
@@ -526,10 +599,16 @@ class AeroLabDaemon:
         label = c.get("name") or section
         init = drivers.SERIAL_SCRIPTS.get(c.get("init_script", ""), b"") + _unescape(c.get("init", ""))
         poll = _unescape(c.get("poll", ""))
+        raw = rawlog.RawWriter(self.log_dirs(), section, {"name": label, "port": c["port"], "baud": c["baud"],
+                                                          "driver": name, "flight_id": self.state.flight_id},
+                               on_error=self._data_error)
+        self.raw[section] = raw
         async for data in self._serial_chunks(label, c["port"], int(c["baud"]), init=init, poll=poll,
                                               poll_hz=float(c.get("poll_hz", 0) or 0)):
+            ts = (time.time_ns(), time.monotonic_ns())
+            raw.write(data, *ts)
             for reading in drv.feed(data):
-                self.apply(reading, role)
+                self.apply(reading, role, ts)
             st = getattr(drv, "stats", None)
             if st is not None:
                 mon.on_counters(time.time(), st.good, st.bad)
@@ -580,6 +659,8 @@ class AeroLabDaemon:
                             print(f"[trigger] HTTP capture failed: {exc}", flush=True)
                     asyncio.create_task(_fire())
                 self.state.trigger_count += 1
+                self.readings.add("trigger", (self.state.flight_id, self.state.trigger_count,
+                                              time.time_ns(), time.monotonic_ns()))
                 s = self.state
                 lat, lon = self.extrapolated_position(ts)
                 ages = {k: (ts - v) * 1000 if v else None for k, v in self.last_seen.items()}
@@ -621,17 +702,23 @@ class AeroLabDaemon:
         self.state.imu_ok = (now - self.last_seen["imu"]) < STALE_AFTER_S
 
     async def logger_loop(self):
-        """Dual-write every sample: SQLite (WAL) plus fsynced 5-minute CSV chunks."""
+        """Dual-write a 5 Hz state sample: SQLite (WAL) plus fsynced 5-minute CSV chunks.
+
+        Every laser reading and GNSS fix goes to the per-reading tables and raw
+        files separately (rawlog.py); this is the display-rate summary. A write
+        error never stops it: it reports, checks whether the SSD went away (and
+        moves to the fallback disk if so), reopens and carries on.
+        """
         rotate_s = float(self.cfg["logging"]["rotate_minutes"]) * 60.0
         interval = 1.0 / float(self.cfg["logging"]["log_hz"])
-        conn = self._connect_db()
-        csv_file = None
-        csv_writer = None
-        chunk_start = 0.0
         fields = list(asdict(self.state).keys())
-
-        try:
-            while True:
+        conn = csv_file = csv_writer = None
+        chunk_start = 0.0
+        while True:
+            self.sup.beat("logger")
+            try:
+                if conn is None:
+                    conn = self._connect_db()
                 ts, iso = now_utc()
                 self.state.unix_ts, self.state.utc_iso = ts, iso
                 self.refresh_health(time.time())
@@ -674,17 +761,32 @@ class AeroLabDaemon:
                 conn.commit()
                 self.state.logging_active = True
                 await asyncio.sleep(interval)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            # Disk full or SSD pulled: tell the HUD instead of dying silently.
-            self.state.logging_active = False
-            print(f"[logger] stopped: {exc}", flush=True)
-            raise
-        finally:
-            if csv_file:
-                csv_file.close()
-            conn.close()
+            except asyncio.CancelledError:
+                for h in (csv_file, conn):
+                    try:
+                        h and h.close()
+                    except Exception:
+                        pass
+                raise
+            except (OSError, sqlite3.Error, ValueError) as exc:
+                self.state.logging_active = False
+                self._data_error(f"flight log: {exc}")
+                for h in (csv_file, conn):
+                    try:
+                        h and h.close()
+                    except Exception:
+                        pass
+                conn = csv_file = csv_writer = None
+                self.recheck_log_dir()
+                await asyncio.sleep(1.0)
+
+    async def clock_loop(self):
+        """Once a second: the system and monotonic clocks side by side, so a clock step in flight is visible
+        afterwards and every timestamp can be moved onto GPS time in processing."""
+        while True:
+            self.sup.beat("clock")
+            self.readings.add("clock", (self.state.flight_id, time.time_ns(), time.monotonic_ns()))
+            await asyncio.sleep(1.0)
 
     # -- self-test and integrity --------------------------------------------
 
@@ -732,6 +834,9 @@ class AeroLabDaemon:
         if ps.get("enabled"):
             items.append({"item": "Payload trigger", "status": "ok" if s.trigger_count > 0 and (s.gpio_live or self.sim_mode) else "warn",
                           "detail": f"{s.trigger_count} pulses" + ("" if s.gpio_live else " (no GPIO pin driven)")})
+        if self.pps.enabled:
+            st = self.pps.status()
+            items.append({"item": "GNSS PPS timing", "status": "ok" if st["ok"] else "warn", "detail": st["detail"]})
         items.append({"item": "Calibration", "status": "ok" if self.cal.updated else "warn",
                       "detail": f"ground calibration from {self.cal.updated}" if self.cal.updated
                       else "not calibrated: run Calibrate in Buddy before the first flight"})
@@ -744,6 +849,9 @@ class AeroLabDaemon:
         else:
             self.buddy.emit("alert" if n_fail else "warn",
                             f"Self-test: {n_fail} failed, {n_warn} warnings. See Ground check.")
+        self.findings = diagnose.findings(self, self.catalog)
+        self.ready = diagnose.readiness(self.findings)
+        self.write_report()
         conn = self._connect_db()
         conn.execute("UPDATE flights SET self_test = ? WHERE id = ?", (json.dumps(self.bit), self.state.flight_id))
         conn.commit()
@@ -767,6 +875,13 @@ class AeroLabDaemon:
     def integrity_tick(self, now: float):
         """Edge-triggered integrity callouts, once a second."""
         s, b = self.state, self.buddy
+        # Data safety first: are readings reaching the disk?
+        r = self.readings
+        behind = (not r.healthy) or len(r.q) > 2000
+        b._edge("data.behind", self.steady("data", behind, now, 3.0),
+                ("alert", f"Science data is NOT being saved ({len(r.q)} readings waiting). Check the log disk."),
+                ("info", "Science data saving again; nothing was lost" if not r.dropped else
+                 f"Science data saving again; {r.dropped} readings lost while the disk was gone"))
         names = b.names()
         if not self.bit.get("done"):
             return  # let the self-test report first
@@ -797,6 +912,53 @@ class AeroLabDaemon:
                         ("warn", f"Heading differs from GNSS track by {abs(d or 0):.0f}°: wind crab or heading error"),
                         ("info", "Heading agrees with GNSS track"))
 
+    def report_html(self) -> str:
+        """A self-contained readiness report: what was checked, what was found, what to do."""
+        import html as H
+        s, r = self.state, self.ready
+        color = {"green": "#0a7d3b", "amber": "#a86400", "red": "#b3261e"}[r["level"]]
+        rows = lambda items: "".join(
+            f"<tr><td class='{H.escape(i['status'])}'>{H.escape(i['status'].upper())}</td><td>{H.escape(i['item'])}</td>"
+            f"<td>{H.escape(str(i['detail']))}</td></tr>" for i in items)
+        finds = "".join(
+            f"<div class='f {f['severity']}'><b>{H.escape(f['title'])}</b>"
+            + (f"<div class='ev'>{H.escape(f['evidence'])}</div>" if f["evidence"] else "")
+            + "<ol>" + "".join(f"<li>{H.escape(x)}</li>" for x in f["steps"]) + "</ol></div>" for f in self.findings)
+        dev = "".join(f"<tr><td>{H.escape(k)}</td><td>{H.escape(str((self.cfg.get(sec) or {}).get('name', '-')))}</td>"
+                      f"<td>{H.escape(str((self.cfg.get(sec) or {}).get('port', '-')))}</td>"
+                      f"<td>{H.escape(str((self.cfg.get(sec) or {}).get('baud', '-')))}</td></tr>"
+                      for k, sec in (("GNSS", "gnss"), ("Laser", "laser_altimeter"), ("Attitude", "imu_ahrs")))
+        cal = self.cal.summary()
+        data = self.data_status()
+        return f"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AeroLab-Pi readiness, flight {s.flight_id}</title><style>
+body{{font:15px/1.45 system-ui,sans-serif;max-width:860px;margin:24px auto;padding:0 16px;color:#111;background:#fff}}
+h1{{font-size:22px}}h2{{font-size:17px;margin-top:28px;border-bottom:1px solid #ddd}}
+.v{{background:{color};color:#fff;padding:12px 16px;border-radius:8px;font-weight:700;font-size:18px}}
+table{{border-collapse:collapse;width:100%}}td,th{{border-bottom:1px solid #eee;padding:6px;text-align:left;vertical-align:top}}
+.ok{{color:#0a7d3b;font-weight:700}}.warn{{color:#a86400;font-weight:700}}.fail{{color:#b3261e;font-weight:700}}
+.f{{border-left:5px solid #999;padding:6px 12px;margin:10px 0;background:#fafafa}}.f.blocker{{border-color:#b3261e}}
+.f.warn{{border-color:#a86400}}.ev{{color:#555;font-size:13px}}code{{background:#f2f2f2;padding:1px 4px}}
+</style></head><body>
+<h1>AeroLab-Pi readiness · flight {s.flight_id}</h1>
+<div class="v">{H.escape(r['text'])}</div>
+<p>{H.escape(time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime()))} · profile {H.escape(str(self.cfg.get('profile', '-')))}
+ · software {H.escape(diagnose.git_version(APP_ROOT))}{' · <b>SIMULATION</b>' if s.sim_mode else ''}</p>
+<h2>What to do</h2>{finds or '<p>Nothing to fix.</p>'}
+<h2>Self-test at boot</h2><table>{rows(self.bit.get('items', []))}</table>
+<h2>Devices</h2><table><tr><th>Role</th><th>Device</th><th>Port</th><th>Baud</th></tr>{dev}</table>
+<h2>Calibration</h2><p>Laser offset {cal.get('laser_offset_m')} m · IMU bias {cal.get('imu_roll_bias_deg')}° / {cal.get('imu_pitch_bias_deg')}°
+ · boresight {cal.get('boresight_roll_deg')}° / {cal.get('boresight_pitch_deg')}° · updated {H.escape(cal.get('updated') or 'never')}</p>
+<h2>Data</h2><p>{data['readings_written']} readings written, {data['queued']} waiting, {data['dropped']} lost ·
+ log dir <code>{H.escape(str(self.log_dir))}</code> · mirrors {H.escape(', '.join(data['mirrors']) or 'none')}</p>
+</body></html>"""
+
+    def write_report(self):
+        try:
+            (self.log_dir / f"flight_{self.state.flight_id}_readiness.html").write_text(self.report_html())
+        except OSError as exc:
+            self._data_error(f"readiness report: {exc}")
+
     def health(self) -> dict:
         now = time.time()
         return {role: m.snapshot(now) for role, m in self.monitors.items()}
@@ -805,12 +967,16 @@ class AeroLabDaemon:
         n = 0
         warmed = False
         while True:
+            self.sup.beat("buddy")
             now = time.time()
             if n % 10 == 0:
                 await self.buddy.refresh_slow(self.log_dir)
             self.refresh_health(now)
             self.buddy.evaluate(self.state, self.log_dir, self.fallback_logging)
             self.integrity_tick(now)
+            if self.bit.get("done"):
+                self.findings = diagnose.findings(self, self.catalog)
+                self.ready = diagnose.readiness(self.findings)
             if self.capture and not self.capture.done:
                 self.capture.add(trigger_count=self.state.trigger_count)
                 if self.capture.progress >= 1.0:
@@ -835,7 +1001,17 @@ class AeroLabDaemon:
         d["_bit"] = self.bit
         d["_health"] = self.health()
         d["_cal"] = self.cal_status()
+        d["_data"] = self.data_status()
+        d["_ready"] = self.ready
         return json.dumps(d)
+
+    def data_status(self) -> dict:
+        r = self.readings
+        return {"readings_written": r.written, "queued": len(r.q), "dropped": r.dropped, "db_ok": r.healthy,
+                "raw": {k: {"bytes": w.bytes, "frames": w.frames, "errors": w.errors, "dirs": [str(d) for d in w.dirs]}
+                        for k, w in self.raw.items()},
+                "mirrors": [str(d) for d in self.mirror_dirs], "tasks": self.sup.status(),
+                "pps": self.pps.status()}
 
     def cal_status(self) -> dict:
         out = {"calibration": self.cal.summary()}
@@ -847,6 +1023,7 @@ class AeroLabDaemon:
     async def broadcast_loop(self):
         interval = 1.0 / float(self.cfg["server"]["hud_hz"])
         while True:
+            self.sup.beat("broadcast")
             if self.clients:
                 self.refresh_health(time.time())
                 payload = self.payload()
@@ -860,14 +1037,26 @@ class AeroLabDaemon:
             await asyncio.sleep(interval)
 
     def start(self):
+        """Every loop runs under the supervisor: a crash restarts that loop, not the flight."""
+        sup = self.sup
+        self.tasks = []
         if self.sim_mode:
-            loops = [self.sim_loop()]
+            self.tasks.append(sup.run("simulator", self.sim_loop))
         else:
-            loops = [self.sensor_loop(sec) for sec in ("gnss", "laser_altimeter", "imu_ahrs")
-                     if section_enabled(self.cfg, sec)]
-        loops += [self.payload_sync_loop(), self.logger_loop(), self.buddy_loop(), self.broadcast_loop(),
-                  self.run_bit()]
-        self.tasks = [asyncio.create_task(c) for c in loops]
+            for sec in ("gnss", "laser_altimeter", "imu_ahrs"):
+                if section_enabled(self.cfg, sec):
+                    self.tasks.append(sup.run(f"{sec} reader", lambda sec=sec: self.sensor_loop(sec)))
+        self.tasks += [
+            sup.run("payload trigger", self.payload_sync_loop),
+            sup.run("logger", self.logger_loop, stall_s=20),
+            sup.run("reading log", self.readings.run),
+            sup.run("clock", self.clock_loop, stall_s=20),
+            *( [sup.run("pps", self.pps.run)] if self.pps.enabled else [] ),
+            sup.run("buddy", self.buddy_loop, stall_s=60),
+            sup.run("broadcast", self.broadcast_loop, stall_s=30),
+            asyncio.create_task(self.run_bit()),
+            asyncio.create_task(watchdog(sup)),
+        ]
 
     async def stop(self):
         for t in self.tasks:
@@ -875,6 +1064,17 @@ class AeroLabDaemon:
         for t in self.tasks:
             with contextlib.suppress(BaseException):
                 await t
+        for w in self.raw.values():
+            w.close()
+        # final flush of queued readings
+        try:
+            conn = sqlite3.connect(self.db_path)
+            conn.executescript(rawlog.READINGS_SCHEMA)
+            while self.readings.q:
+                self.readings._flush(conn)
+            conn.close()
+        except sqlite3.Error:
+            pass
 
 
 def create_app(daemon: AeroLabDaemon) -> FastAPI:
@@ -904,6 +1104,19 @@ def create_app(daemon: AeroLabDaemon) -> FastAPI:
     @app.post("/api/bit/run")
     async def run_bit():
         return JSONResponse(await daemon.run_bit(delay=float(os.environ.get("AEROLAB_BIT_DELAY", 3.0))))
+
+    @app.get("/api/diagnose")
+    async def get_diagnose():
+        daemon.findings = diagnose.findings(daemon, daemon.catalog)
+        daemon.ready = diagnose.readiness(daemon.findings)
+        return JSONResponse({"readiness": daemon.ready, "findings": daemon.findings, "data": daemon.data_status()})
+
+    @app.get("/report")
+    async def get_report():
+        from fastapi.responses import HTMLResponse
+        daemon.findings = diagnose.findings(daemon, daemon.catalog)
+        daemon.ready = diagnose.readiness(daemon.findings)
+        return HTMLResponse(daemon.report_html())
 
     @app.get("/api/health")
     async def get_health():

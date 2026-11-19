@@ -123,33 +123,37 @@ def caption(im: Image.Image, text: str, chapter: str = "", band: bool = False) -
 def accuracy_card(reports: list[dict]) -> Image.Image:
     im = Image.new("RGB", (W, H), BG)
     d = ImageDraw.Draw(im)
-    d.text((60, 40), "7  ACCURACY, MEASURED", font=font(FONT_B, 22), fill=ACCENT)
+    d.text((60, 40), "8  ACCURACY, MEASURED", font=font(FONT_B, 22), fill=ACCENT)
     d.text((60, 72), "Real daemon vs simulated sensors speaking each device's protocol, known truth",
            font=font(FONT, 24), fill=(220, 226, 232))
     d.text((60, 108), "Injected: IMU bias +0.8/-0.5°, laser offset 0.62 m (0.40 entered), 1.0° boresight, "
                       "2% corrupt frames, 1% laser spikes", font=font(FONT, 18), fill=MUTED)
-    cols = [("Profile", 60), ("Height", 410), ("Offset", 500), ("IMU bias", 590),
-            ("Boresight", 760), ("AGL p95", 880), ("Geotag p95", 1000)]
+    cols = [("Profile", 60), ("Height", 395), ("Offset", 470), ("IMU bias", 545), ("Boresight", 700),
+            ("AGL p95", 815), ("Laser pts p95", 925), ("Logged", 1075)]
     y = 170
     for name, x in cols:
-        d.text((x, y), name, font=font(FONT_B, 18), fill=MUTED)
+        d.text((x, y), name, font=font(FONT_B, 17), fill=MUTED)
     y += 36
-    names = {"airborne-snow-survey": "Snow survey (Riegl, VN-200)", "survey-budget": "Budget (TF03, F9P, BNO085)",
-             "midrange-aircraft": "Mid-range (GRF-500, VN-100)", "flight-controller": "Flight controller (MAVLink)",
-             "bench-generic": "Generic serial"}
+    names = {"airborne-snow-survey": "Snow survey (Reach M2, ILM-150-R)", "long-range-survey": "Long-range (Riegl, VN-200)",
+             "survey-budget": "Budget (TF03, F9P, BNO085)", "midrange-aircraft": "Mid-range (GRF-500, VN-100)",
+             "flight-controller": "Flight controller (MAVLink)", "bench-generic": "Generic serial"}
+    na = lambda v, f: "n/a" if v is None or v != v else f.format(v)
     for r in reports:
-        s, c, b = r["score"], r["calibration"], r["boresight_fit"]
-        vals = [names.get(r["profile"], r["profile"]), f"{s['survey_agl_m']:.0f} m", f"{c['laser_offset_m']:.2f} m",
-                f"{c['imu_roll_bias_deg']:+.2f} / {c['imu_pitch_bias_deg']:+.2f}°",
-                f"{b['boresight_roll_deg']:+.2f}°", f"{s['agl_after_boresight_m']['p95']:.2f} m",
-                f"{s['geotag_last_fix_m']['p95']:.1f} → {s['geotag_extrapolated_m']['p95']:.1f} m"]
+        s_, c, b = r["score"], r["calibration"], r.get("boresight_fit") or {}
+        att = r.get("has_attitude", True)
+        vals = [names.get(r["profile"], r["profile"]), f"{s_['survey_agl_m']:.0f} m", f"{c['laser_offset_m']:.2f} m",
+                (f"{c['imu_roll_bias_deg']:+.2f}/{c['imu_pitch_bias_deg']:+.2f}°" if att else "no sensor"),
+                (na(b.get("boresight_roll_deg"), "{:+.2f}°") if att else "n/a"),
+                f"{s_['agl_after_boresight_m']['p95']:.2f} m",
+                na(s_.get("laser_point_position_m", {}).get("p95"), "{:.2f} m"),
+                f"{r.get('completeness', {}).get('pct', float('nan')):.1f}%"]
         for (name, x), v in zip(cols, vals):
-            d.text((x, y), v, font=font(FONT, 18), fill=(235, 240, 245))
-        y += 44
+            d.text((x, y), v, font=font(FONT, 17), fill=(235, 240, 245))
+        y += 42
     d.text((60, y + 20), "True values: offset 0.62 m, bias +0.80 / -0.50°, boresight +1.00°.", font=font(FONT, 20),
            fill=(0, 230, 118))
-    d.text((60, y + 54), "Geotag: last GNSS fix → position extrapolated to the trigger instant.", font=font(FONT, 20),
-           fill=MUTED)
+    d.text((60, y + 54), "Logged: laser readings saved / clean frames sent while running. Laser pts: position error "
+                         "of each laser reading matched on GNSS time.", font=font(FONT, 18), fill=MUTED)
     d.text((60, y + 84), "Simulation shows the software is right; only flight tests show the installation is.",
            font=font(FONT, 20), fill=MUTED)
     return im
@@ -303,7 +307,9 @@ async def record_display(port: int, workdir: Path) -> tuple[Recorder, dict]:
     await click("#p-buddy")
     await asyncio.sleep(0.6)
     await click("[data-pane=pane-check]")
-    await asyncio.sleep(3.0)
+    await asyncio.sleep(4.5)
+    await js("document.getElementById('datastat').scrollIntoView({block:'center'})")
+    await asyncio.sleep(4.0)
     await js("document.getElementById('bitlist').scrollIntoView({block:'start'})")
     await asyncio.sleep(3.5)
     await js("document.getElementById('healthrows').scrollIntoView({block:'center'})")
@@ -314,7 +320,7 @@ async def record_display(port: int, workdir: Path) -> tuple[Recorder, dict]:
     rec.start("ask")
     await click("[data-pane=pane-ask]")
     await asyncio.sleep(1.0)
-    for q in ("Quick status", "Why did the laser drop out?", "Should I descend over the ice?"):
+    for q in ("What's wrong?", "Why did the laser drop out?", "Should I descend over the ice?"):
         await js(f"(()=>{{document.getElementById('q').value={json.dumps(q)};}})()")
         await asyncio.sleep(1.2)
         await js("document.getElementById('askform').requestSubmit()")
@@ -388,7 +394,7 @@ def main():
     base = yaml.safe_load((ROOT / "config" / "sensors.yaml").read_text())
     prof = configure.by_id(cat["profiles"])["airborne-snow-survey"]
     cfg = configure.build_config(base, configure.profile_answers(prof, base, cat, "sim"), cat)
-    cfg["sim"] = {"faults": True, "bank_deg": 24.0, "start_on_ground": True}
+    cfg["sim"] = {"faults": True, "bank_deg": 4.0, "start_on_ground": True}
     cfg["buddy"]["ai"] = False
     cfg["logging"]["fallback_dir"] = str(work / "logs")
     cfg["calibration_file"] = str(work / "cal.json")
@@ -419,24 +425,25 @@ def main():
     cut.still(card("AeroLab-Pi", ["A Raspberry Pi logger and cockpit display", "for small-aircraft science payloads.",
                                   "", "Open source. Works offline."], "DEMO"), 4.5)
     cut.still(card("One Pi, every instrument", [
-        "Laser altimeter → height above ground, corrected for bank and pitch",
+        "Laser altimeter → height above ground (tilt-corrected with an attitude sensor)",
         "GNSS or GNSS/INS → position, time, attitude",
         "Camera and radar trigger → every capture geotagged",
         "Everything logged so a power cut loses almost nothing",
         "A display any iPad in the cockpit can open"], "WHAT IT DOES"), 7.0)
     ch = "1  SETUP"
-    for n, txt in ((3, "Setup starts from a profile. The default is an estimate for a light-aircraft ice survey."),
-                   (5, "Each device is a preset: driver, baud rate and protocol quirks come with it."),
+    for n, txt in ((3, "Setup starts from a profile. The default is this snow survey: Reach M2, AgLaser ILM-150-R, RedEdge-P, snow radar."),
+                   (8, "Each device is a preset: driver, baud rate and settings, with notes on how to set the device up."),
                    (7, "Laser altimeters are listed with their rated range."),
-                   (16, "Setup checks the planned survey height against the laser. Most lasers can't reach 2,000 ft."),
-                   (17, "Payloads: cameras bring their trigger settings; the snow radar records on its own GPS."),
-                   (25, "A summary before anything is saved. Change it any time with ./configure.sh.")):
+                   (17, "Setup checks the planned survey height against the laser: the ILM-150-R reads nothing at 2,250 ft."),
+                   (18, "Payloads: the camera brings its trigger settings; the snow radar records on its own GPS."),
+                   (21, "PPS from the Reach M2 puts every timestamp on GPS time to microseconds."),
+                   (28, "A summary before anything is saved. Change it any time with ./configure.sh.")):
         cut.still(caption(pick(n), txt, ch), 4.2, fade=False)
 
     ch = "2  BOOT SELF-TEST"
     bf = rec.scene_frames("boot")
     cut.clip(bf, 0.3, bf[-1][0], [(0, "Every boot runs a self-test: config, a write-and-read test of the log disk, then each sensor's data rate, bad frames and plausibility."),
-                                   (7.5, "The aircraft is on the ramp: the laser reads its own mounting height. Calibration is flagged as not done yet.")], ch)
+                                   (7.5, "On the ramp: the laser reads its own mounting height, attitude is left to post-processing, calibration is not done yet.")], ch)
 
     ch = "3  GROUND CALIBRATION"
     cf = rec.scene_frames("cal")
@@ -450,33 +457,42 @@ def main():
     ch = "4  IN FLIGHT"
     ff = rec.scene_frames("flight")
     tt = marks.get("toast") or ff[-1][0] - 6
-    cut.clip(ff, 0.5, 14.0, [(0, "Height above ground, corrected for bank and pitch. Attitude, position and every sensor's health along the top."),
-                             (7.0, "Past 20° of bank the tilt correction is less certain, and the display says so.")], ch)
+    cut.clip(ff, 0.5, 14.0, [(0, "Laser AGL at 9 Hz, position at 10 Hz, every sensor's health along the top."),
+                             (7.0, "Attitude is applied in post-processing, so the display says the AGL is not tilt-corrected.")], ch)
     cut.clip(ff, max(14.0, tt - 2.0), min(ff[-1][0], tt + 7.0),
              [(0, "Buddy calls out changes: a sensor lost or back, GNSS fix, the low-AGL line, logging, disk, heat, power."),
-              (4.5, "The laser drops out over open water or glassy ice; the display shows dashes, never a frozen number.")], ch)
+              (4.5, "The laser drops out over open water or glassy ice; the display shows dashes, never a frozen number. Every raw byte is still saved.")], ch)
 
     ch = "5  CHECKS"
     kf = rec.scene_frames("checks")
-    cut.clip(kf, 0.0, kf[-1][0], [(0, "Ground check from live data: on the ramp the laser should read about 0 m."),
-                                  (3.2, "The self-test results stay available."),
-                                  (6.8, "Live data rate, bad frames and age for every sensor. A wrong baud rate shows up here at once.")], ch)
+    cut.clip(kf, 0.0, kf[-1][0], [(0, "One verdict up top, then each problem with numbered fixes, most likely first."),
+                                  (4.6, "Science data: readings saved, waiting and lost; raw bytes per sensor; mirror; PPS."),
+                                  (8.6, "The boot self-test results stay available."),
+                                  (12.2, "Live data rate, bad frames and age for every sensor. A wrong baud rate shows up here at once.")], ch)
 
     ch = "6  ASK BUDDY"
     af = rec.scene_frames("ask")
-    cut.clip(af, 0.0, af[-1][0], [(0, "Ask answers from the Pi's own data, offline."),
+    cut.clip(af, 0.0, af[-1][0], [(0, "Ask \"what's wrong?\" and Buddy answers with the same findings and the first thing to try."),
                                   (6.0, "A dropout answer gives when and how long. The data doesn't say why, so causes are only listed as possibilities."),
                                   (11.0, "Flight decisions stay with the pilot.")], ch)
 
-    cut.still(accuracy_card(reports), 10.0)
+    cut.still(card("Data you don't lose", [
+        "Every laser reading and GNSS fix logged with nanosecond timestamps",
+        "Every raw byte from every sensor kept on disk, optionally mirrored",
+        "Logging moves to another disk if the SSD goes; crashed tasks restart",
+        "Laser points matched to GNSS position on GNSS time, refinable later",
+        "", "tools/export_laser.py  ·  tools/raw_export.py"], "7  DATA"), 7.5)
+    cut.still(accuracy_card(reports), 11.0)
     cut.still(card("Tested, then flown", [
         "Self-test every boot · ground calibration before each flight",
-        "Integrity checks every second in flight",
-        "Boresight fitted from banks over flat ground",
+        "Integrity checks every second in flight · readiness report per flight",
+        "Probe tells you what's on a serial port, at which baud",
         "Virtual flights for every hardware profile in the test suite",
         "", "Not certified avionics: advisory, for the science payload."], "SUMMARY"), 7.0)
     cut.still(card("github.com/craigm26/aerolab-pi", ["./install.sh on a Raspberry Pi 5", "or try it on a laptop:",
-                                                      "python daemon/main.py --sim"], "OPEN SOURCE"), 5.0)
+                                                      "python daemon/main.py --sim",
+                                                      "", "Simulation shows the software is right;",
+                                                      "the bench and flight tests show the installation is."], "OPEN SOURCE"), 6.0)
     cut.close()
     print(f"wrote {a.out}: {cut.seconds:.0f} s")
 

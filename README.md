@@ -8,7 +8,7 @@ The Pi reads the sensors, works out height above ground corrected for bank and p
 
 *Startup: the display checks each sensor off as its data arrives, then hands over. Recorded from simulation mode.*
 
-**Demo video (2 min 19 s):** [docs/aerolab-demo.mp4](docs/aerolab-demo.mp4). Setup, boot self-test, ground calibration, flight, callouts, Buddy and the accuracy results, all recorded from the running code in simulation mode.
+**Demo video (2 min 39 s):** [docs/aerolab-demo.mp4](docs/aerolab-demo.mp4). Setup, boot self-test, ground calibration, flight, callouts, Buddy and the accuracy results, all recorded from the running code in simulation mode.
 
 [![Demo video](docs/images/demo_poster.jpg)](docs/aerolab-demo.mp4)
 
@@ -20,7 +20,8 @@ The Pi reads the sensors, works out height above ground corrected for bank and p
 - **Hardware presets.** Pick your laser, GNSS/INS, attitude sensor and payloads from a catalog of common science hardware, or start from a whole-aircraft profile. Each preset carries the right driver, baud rate and protocol quirks.
 - **Cockpit display.** AGL in large digits (amber below a height you choose), attitude ball, heading, altitude, position, and a status pill per sensor. A sensor that goes quiet for 2 seconds turns red and shows `---` instead of a frozen number.
 - **Buddy.** Callouts when something changes (sensor lost or back, GNSS fix, low AGL, logging, disk, heat, power), optionally spoken aloud. A preflight ground check. Questions answered from the Pi's own data, with an optional local AI model.
-- **Logs that survive a power cut.** Every sample goes to SQLite (WAL mode) and to a CSV file fsynced after each row and rotated every 5 minutes.
+- **No lost science data.** Every laser reading and every GNSS fix is logged with nanosecond timestamps, and every raw byte from every sensor is kept on disk (optionally mirrored to a second drive). Logging survives a pulled SSD, a full disk or a crashed task, and a watchdog restarts anything that wedges. See [Data you don't lose](#data-you-dont-lose).
+- **Laser readings matched to GNSS position** on GNSS time, with timing corrections you can refine later without re-flying.
 - **Geotagged payload triggers.** A GPIO pulse (or an HTTP capture request) at a fixed rate, with position, AGL and attitude logged at each one.
 - **Accuracy you can check.** A self-test at every boot, a ground calibration before each flight, integrity checks every second in flight, a boresight fit after flight, and virtual flights against known truth in the test suite. See [Accuracy](#accuracy-testing-and-calibration).
 - **Simulation mode.** A made-up flight at your planned survey height, so the display, maths, logs and Buddy can be tested with nothing wired.
@@ -41,10 +42,10 @@ All screenshots are from simulation mode with the airborne snow survey profile. 
 
 | Kind | Devices |
 |---|---|
-| Laser altimeters | Riegl LD90-3800, Jenoptik/ASTECH LDM301, LightWare GRF-500, SF11/C, LW20/C, Benewake TF03-180, TF02-Pro, generic ASCII (m or cm) |
-| GNSS and GNSS/INS | u-blox ZED-F9P, NEO-M9N, NEO-M8N, Septentrio mosaic-X5, NovAtel OEM7, VectorNav VN-200, VN-300, SBG Ellipse-N/D, Applanix APX-15, ArduPilot/PX4 over MAVLink, generic NMEA |
-| Attitude | From the GNSS/INS, VectorNav VN-100, BNO085/086 (UART-RVC), SBG Ellipse-A, MAVLink, generic `roll,pitch,yaw` lines |
-| Payloads | CReSIS/KU 2-8 GHz snow radar, MicaSense Altum-PT/RedEdge-P (trigger pin or HTTP capture), Sentera 6X, generic 3.3 V trigger |
+| Laser altimeters | AgLaser ILM-150-R, Riegl LD90-3800, Jenoptik/ASTECH LDM301, LightWare GRF-500, SF11/C, LW20/C, Benewake TF03-180, TF02-Pro, generic ASCII (m or cm) |
+| GNSS and GNSS/INS | Emlid Reach M2 (NMEA or ERB binary), u-blox ZED-F9P, NEO-M9N, NEO-M8N, Septentrio mosaic-X5, NovAtel OEM7, VectorNav VN-200, VN-300, SBG Ellipse-N/D, Applanix APX-15, ArduPilot/PX4 over MAVLink, generic NMEA |
+| Attitude | None (applied in post-processing), from the GNSS/INS, VectorNav VN-100, BNO085/086 (UART-RVC), SBG Ellipse-A, MAVLink, generic `roll,pitch,yaw` lines |
+| Payloads | CReSIS/KU 2-8 GHz snow radar, MicaSense RedEdge-P and Altum-PT (trigger pin or HTTP capture), Sentera 6X, generic 3.3 V trigger |
 
 Every entry records where its protocol details come from:
 
@@ -61,6 +62,7 @@ Most affordable lasers stop far short of survey heights:
 | Laser | Rated range | Height that is |
 |---|---|---|
 | Benewake TF02-Pro | about 40 m | 130 ft |
+| AgLaser ILM-150-R | 150 m (90% white), 75 m (18% grey) | 490 ft |
 | LightWare LW20/C | 100 m | 330 ft |
 | LightWare SF11/C | 120 m | 390 ft |
 | Benewake TF03-180 | 180 m (90% target), 70 m (10%) | 590 ft |
@@ -74,13 +76,21 @@ Snow and ice reflect well, but fresh snow at a shallow angle, glassy ice and ope
 
 | Profile | GNSS | Attitude | Laser | Payloads |
 |---|---|---|---|---|
-| **Airborne snow survey** (default) | VectorNav VN-200 | from the VN-200 | Riegl LD90-3800 | snow radar, MicaSense Altum-PT |
+| **Airborne snow survey** (default) | Emlid Reach M2 | none (post-processing) | AgLaser ILM-150-R | snow radar, MicaSense RedEdge-P |
+| Long-range laser survey | VectorNav VN-200 | from the VN-200 | Riegl LD90-3800 | snow radar, MicaSense Altum-PT |
 | Survey on a budget | u-blox ZED-F9P | BNO085 | TF03-180 | MicaSense |
 | Mid-range laser altimetry | ZED-F9P | VN-100 | GRF-500 | Sentera 6X |
 | Flight controller | MAVLink | MAVLink | TF03-180 | generic camera |
 | Generic serial | any NMEA | `roll,pitch,yaw` lines | ASCII laser | generic camera |
 
-The default profile is an estimate for a light-aircraft ice survey at 2,000 to 2,500 ft AGL. It assumes GNSS/INS position and attitude, a long-range laser, a 2-8 GHz snow radar recording on its own GPS, and a multispectral camera triggered once a second.
+The default profile is a light-aircraft snow survey:
+
+- Reach M2 for position and time, with raw logging on the Reach for PPK;
+- the ILM-150-R laser at 9 Hz;
+- a RedEdge-P triggered once a second;
+- the 2-8 GHz snow radar recording on its own GPS.
+
+Attitude and georeferencing are applied in post-processing, so the live AGL is labelled "not tilt-corrected". The ILM-150-R is rated to 150 m: laser legs need to be around 350 ft AGL. At the 2,000-2,500 ft radar height it reads nothing, and setup says so.
 
 ## Buddy
 
@@ -118,6 +128,50 @@ Tap **BUDDY** on the display. Four tabs: **Callouts**, **Checks** (ground check,
 - **Accuracy:** a small model can still be wrong.
 
 Buddy is meant for the ground and for crew. A solo pilot should not be typing in flight; the spoken callouts are the in-flight part.
+
+## Data you don't lose
+
+**Every reading, not samples.** Each laser range and each GNSS fix is written to its own table (`laser_readings`, `gnss_fixes`) with two timestamps taken the moment its bytes arrived:
+
+- `utc_ns`: the system clock;
+- `mono_ns`: the monotonic clock, which never jumps.
+
+Rows are committed every 0.5 s. The 5 Hz `telemetry` table is only the display summary.
+
+**Every byte, raw.** Each sensor's serial stream is also written to `raw/<sensor>_<time>.aeroraw` exactly as received, framed with the same two timestamps. It is fsynced every second and rotated hourly. Nothing is parsed or dropped, so post-processing can re-decode anything later, including messages AeroLab-Pi doesn't understand and a laser format that turns out different from the one assumed. `python tools/raw_export.py <file>` turns a capture back into the plain stream (it opens in RTKLIB, Emlid Studio or a text editor) plus a CSV of when each byte arrived. `--lines` gives one row per text line.
+
+**Mirror.** `logging.mirror_dirs` (asked in setup) sends the raw capture to a second drive as well.
+
+**Recovery.**
+- **Disk problems.** If the SSD is pulled or a write fails, the loggers report it, move to the fallback disk, and keep going. Readings queue in memory, about an hour's worth, until a disk takes them, and come back out in order.
+- **Crashes.** Every task runs under a supervisor, so a crash restarts that task, not the flight.
+- **Hangs.** A systemd watchdog restarts the service if a task wedges, and logging resumes in the same database.
+- **Restart policy.** The unit restarts forever, with no start limit.
+- **Visibility.** Buddy calls out "Science data is NOT being saved" within 3 seconds of a problem, and how many readings, if any, were lost.
+
+**Laser points on GNSS time.** `python tools/export_laser.py` writes `flight_<n>_laser_points.csv`: every laser reading with GNSS time, position, altitude, fix quality and how far it was from the nearest fix. It builds a clock model from the logs:
+- **From GNSS epoch times:** each fix carries its own epoch time; the fastest-arriving fixes give the Pi-to-GNSS offset and drift.
+- **From PPS, when wired:** to microseconds.
+
+`--laser-latency-ms` and `--gnss-latency-ms` let you refine the timing later without re-flying.
+
+**Timing hardware.**
+- **PPS:** wire the Reach M2's PPS (C1 or C2 pin 3) to Pi GPIO 18 and answer yes in setup. The installer enables the kernel PPS driver (`pps-rp1` on a Pi 5), and every edge is logged with the Pi clock's offset from the GPS second.
+- **USB-serial latency:** FTDI adapters buffer up to 16 ms by default; the installer sets 1 ms with a udev rule. CP210x, CH340 and PL2303 adapters have no such setting, so use FTDI for the laser.
+
+**Readiness, with the fixes.** Buddy → Checks opens with one verdict:
+- "Ready: every sensor is recording";
+- "Recording; 2 things to check";
+- or "Not ready: AgLaser ILM-150-R: no data".
+
+Each finding comes with its evidence and numbered steps, most likely fix first. Device-specific steps come from the hardware catalog: power for the ILM-150-R, DB9 pins, Reach output settings, antenna ground plane. A readiness report for each flight is saved as `flight_<n>_readiness.html` in the log folder and served at `/report`. Ask Buddy "what's wrong?" and it answers from the same findings.
+
+**What's on this port?** `python scripts/probe.py <port>` (stop the service first) listens at every baud rate with every protocol and says what it heard. It reports one of three things:
+- nothing at all (power, wiring, TX/RX);
+- noise at every baud (RS-232 levels on a 3.3 V pin);
+- or a clear match at some baud.
+
+Setup offers the same check right after you pick each port.
 
 ## Accuracy: testing and calibration
 
@@ -174,15 +228,18 @@ It fits the tilt that makes laser height track GNSS altitude through the banks, 
 - a 1° laser boresight;
 - 2% corrupted frames, 1% laser spikes and 3 cm of laser noise.
 
-Each run calibrates on the ground, flies a survey leg with ±20° banks, and scores everything logged against the truth. Results for every profile ([docs/accuracy.md](docs/accuracy.md)):
+Each run calibrates on the ground, flies a survey leg (±20° banks where there's an attitude sensor), and scores everything logged against the truth. Results for every profile ([docs/accuracy.md](docs/accuracy.md)):
 
-| Profile | Offset found (true 0.62 m) | IMU bias found (true +0.80/−0.50°) | Boresight found (true 1.00°) | AGL error p95 | Geotag error p95, last fix → extrapolated |
-|---|---|---|---|---|---|
-| Snow survey (Riegl, VN-200) at 686 m | 0.619 m | +0.80/−0.51° | +0.98° | 1.18 m (0.17%) | 1.4 → 0.7 m |
-| Budget (TF03, F9P, BNO085) at 122 m | 0.621 m | +0.80/−0.50° | +1.00° | 0.06 m | 8.8 → 0.7 m |
-| Mid-range (GRF-500, VN-100) at 305 m | 0.6 m (0.1 m steps) | +0.80/−0.50° | +0.92° | 1.07 m | 8.2 → 0.7 m |
-| Flight controller (MAVLink) at 91 m | 0.621 m | +0.80/−0.50° | +1.02° | 0.10 m | 10.9 → 0.8 m |
-| Generic serial at 152 m | 0.619 m | +0.80/−0.50° | +1.00° | 0.23 m | 3.6 → 0.8 m |
+| Profile | Height | Laser readings logged | Laser points matched, p95 error | Offset found (true 0.62 m) | IMU bias found (true +0.80/−0.50°) | Boresight found (true 1.00°) | AGL p95 | Geotag p95, last fix → extrapolated |
+|---|---|---|---|---|---|---|---|---|
+| **Snow survey (Reach M2, ILM-150-R)** | 107 m | 100% | 0.79 m | 0.618 m | no sensor (post-processing) | n/a | 0.40 m | 2.5 → 0.8 m |
+| Long-range (Riegl, VN-200) | 686 m | 100% | 0.72 m | 0.619 m | +0.80/−0.51° | +1.04° | 1.40 m (0.20%) | 0.8 → 0.6 m |
+| Budget (TF03, F9P, BNO085) | 122 m | 100% | 0.79 m | 0.621 m | +0.80/−0.50° | +1.00° | 0.07 m | 9.4 → 0.6 m |
+| Mid-range (GRF-500, VN-100) | 305 m | 100% | 0.80 m | 0.6 m (0.1 m steps) | +0.80/−0.50° | +0.98° | 1.53 m | 11.1 → 0.9 m |
+| Flight controller (MAVLink) | 91 m | 100% | 0.64 m | 0.621 m | +0.80/−0.50° | +1.02° | 0.12 m | 7.4 → 0.8 m |
+| Generic serial | 152 m | 100% | 1.01 m | 0.619 m | +0.80/−0.50° | +1.00° | 0.23 m | 0.8 → 0.7 m |
+
+"Laser readings logged" compares every reading saved against every clean frame sent while the daemon was reading. "Laser points" is each laser reading matched to position on GNSS time by `tools/export_laser.py`, against the true position; the injected GNSS noise was 0.4 m. Her profile flies straight legs (attitude in post-processing), at 107 m because the ILM-150-R is rated to 150 m.
 
 What's left at survey height is mostly timing: the attitude used is up to one sample (25 ms at 40 Hz) older than the laser reading, which matters at 7°/s of roll. Simulation shows the software does what it should; only flight tests over known flat ground show that a given installation does.
 
@@ -271,6 +328,18 @@ The Pi's pins are 3.3 V. A device listed as RS-232 or RS-422 needs a USB-RS232/R
 | Payload trigger | BCM 17 (pin 11) by default; any free pin from the setup menu |
 | Ground | join the payload's signal ground to a Pi ground pin |
 
+### Wiring the snow-survey setup
+
+| From | To | Notes |
+|---|---|---|
+| Reach M2 S1: pin 4 TX, pin 5 RX, pin 1 GND | Pi pin 10 (RX), pin 8 (TX), a ground pin | 3.3 V on both sides; no adapter. Reach output: NMEA, 10 Hz, 115200 baud |
+| Reach M2 C1 pin 3 (PPS), pin 1 GND | Pi GPIO 18 (pin 12), a ground pin | answer yes to the PPS question in setup |
+| ILM-150-R DB9 (data out pin 2, ground pin 5) | USB-RS232 adapter (FTDI) → Pi USB | the laser needs its own 9-24 V supply on the red/black leads |
+| Pi GPIO 17 (pin 11) | RedEdge-P host GPIO set to Trigger input, rising edge | grounds joined; at most 3 captures/s |
+| RedEdge-P GPIO set to Top-of-Frame output, active low | Reach M2 C1 pin 2 (time mark) | every exposure lands in the Reach raw log on GPS time |
+
+On the Reach, turn on raw data logging (UBX or RINEX, 10 Hz). That log is the science-grade position record for PPK; AeroLab-Pi's copy is for the live display and the first match.
+
 Measure `mounting_offset_m`: the vertical distance from the laser lens down to the lowest point of the aircraft. On the ground the display, and the Buddy ground check, should read 0.
 
 For any device not in the catalog, set `driver`, `port` and `baud` by hand in `config/sensors.local.yaml`. The drivers are listed at the bottom of `daemon/drivers.py`. Sensors that answer on demand take `poll` and `poll_hz`; sensors that need a wake-up command take `init`.
@@ -291,6 +360,11 @@ For any device not in the catalog, set `driver`, `port` and `baud` by hand in `c
 
 Everything sits in the log directory.
 
+- `raw/<sensor>_<time>.aeroraw`: every byte from every sensor with arrival timestamps (see [Data you don't lose](#data-you-dont-lose)).
+- `aerolab_flight.db`, tables `laser_readings`, `gnss_fixes`: every reading, with `utc_ns` and `mono_ns`.
+- `aerolab_flight.db`, tables `pps_edges`, `clock_samples`, `triggers_exact`: timing for post-processing.
+- `flight_<n>_readiness.html`: the readiness report for each flight.
+
 - `aerolab_flight.db`, table `telemetry`: every sample at `log_hz` (5 Hz default), including per-sensor health flags.
 - `aerolab_flight.db`, table `payload_triggers`: one row per trigger pulse. `trigger_id` restarts at 1 every boot; `session_start` tells boots apart.
 - `aerolab_flight.db`, table `events`: every Buddy callout.
@@ -306,8 +380,8 @@ A VectorNav GNSS/INS reports height above the ellipsoid, not sea level. The disp
 
 ```bash
 .venv/bin/pip install -r requirements-dev.txt
-.venv/bin/python -m pytest -m "not slow"     # 82 tests, about 7 s
-.venv/bin/python -m pytest                   # plus 2 end-to-end virtual flights, about 2 min
+.venv/bin/python -m pytest -m "not slow"     # 95 tests, about 25 s
+.venv/bin/python -m pytest                   # plus 3 end-to-end virtual flights, about 2.5 min
 python tools/virtual_flight.py               # every profile, with a full report
 ```
 
@@ -321,6 +395,13 @@ The tests cover:
 - **Geometry.** The AGL formula is checked against an independent rotation-matrix derivation at 500 random attitudes.
 - **Integrity.** The spike gate (no lag, real steps accepted), data rate, bad frames and sample age, GNSS jumps, the heading check, the storage test, config checks, and callout debouncing.
 - **Calibration.** Recovery of the offset and bias despite spikes and noise, the inclinometer reference, grading, persistence, and the boresight fit with and without GNSS altitude.
-- **Virtual flights** with pass limits: calibration recovered, boresight within 0.15°, AGL p95 under 0.5% of height, extrapolated geotags under 2 m, and the self-test catching the corrupted frames.
+- **Data safety.**
+  - Raw captures: round trip, mirrors, a dead mirror disk, and a frame torn by a power cut.
+  - The reading log survives the disk vanishing and catches up when it returns.
+  - The logger recovers from a database failure, and logging moves to the SSD when it appears.
+  - The supervisor restarts crashed tasks; the watchdog stops pinging systemd when a task stalls.
+  - PPS capture; the ERB driver; the export clock model removes arrival latency.
+  - Diagnosis gives device-specific steps; probe ranks protocols correctly.
+- **Virtual flights** with pass limits: 99.9% of clean laser frames logged, laser points matched to position within 2 m, calibration recovered, boresight within 0.15°, AGL p95 under 0.5% of height, extrapolated geotags under 2 m, and the self-test catching the corrupted frames.
 
 `tools/` holds the virtual-flight harness and simulated sensors, the boresight tool, and the scripts that made the screenshots, GIFs and demo video from the running code.

@@ -36,7 +36,8 @@ Rules:
 - You report instrument and payload status only. Never give flight, navigation, weather, \
 terrain-clearance or aircraft-control advice. If asked, say that is the pilot's call and give \
 the relevant instrument status instead.
-- AGL comes from a laser and is advisory, not certified avionics."""
+- AGL comes from a laser and is advisory, not certified avionics.
+- When asked how to fix something, use the Diagnosis steps; say which step to try first."""
 
 
 @dataclass
@@ -63,6 +64,7 @@ class Buddy:
     _trigger_seen: tuple = (0, 0.0)
     db_path: Path | None = None
     configured: dict = field(default_factory=lambda: {"gnss": True, "laser": True, "imu": True})
+    diagnosis: object = None          # callable -> plain-text findings with fixes (set by the daemon)
 
     # -- events ------------------------------------------------------------
 
@@ -257,7 +259,8 @@ class Buddy:
             hw[label] = {"model": c.get("name", "generic"), "driver": c.get("driver"), "port": c.get("port")}
         hw["payloads"] = [p.get("name") for p in cfg.get("payloads", [])]
         return {"live": state, "this_flight": stats, "recent_callouts": self.recent(10), "hardware": hw,
-                "names": self.names(), "system": self._slow or system_health(None)}
+                "names": self.names(), "system": self._slow or system_health(None),
+                "diagnosis": self.diagnosis() if callable(self.diagnosis) else ""}
 
     async def ask_stream(self, question: str, ctx: dict):
         """Yield answer text chunks.
@@ -361,6 +364,10 @@ def rule_answer(question: str, ctx: dict, strict: bool = False) -> str | None:
     if any(w in q for w in (" weather", " land", " descend", " climb", " turn ", " fuel", "should i",
                             " fly ", " go around", " divert", " safe to", " ice on", " icing")):
         return "That's the pilot's call; I only watch the instruments. " + status_line()
+    if any(w in q for w in ("wrong", "problem", "troubleshoot", "diagnos", "not working", "isn't working", "issue",
+                            "how do i fix", "how to fix", "ready to fly", "are we ready", "anything to check",
+                            "no data", "not reading", "broken")):
+        return ctx.get("diagnosis") or status_line()
     if " why" in q and any(w in q for w in ("drop", "lost", "lose", "cut out", "fail", "stop", "gap")):
         return why_answer(q, ctx)
     if any(w in q for w in ("how many trigger", "trigger count", "triggers so far", "how many photo",
@@ -457,6 +464,9 @@ def context_text(ctx: dict) -> str:
     hw = ctx.get("hardware", {})
     if hw.get("payloads"):
         lines.append("Payloads: " + ", ".join(p for p in hw["payloads"] if p))
+    if ctx.get("diagnosis"):
+        lines.append("Diagnosis (problems found, with fixes):")
+        lines.append(ctx["diagnosis"])
     ev = ctx.get("recent_callouts") or []
     if ev:
         lines.append("Recent callouts (oldest first):")

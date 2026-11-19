@@ -16,6 +16,36 @@
 # (e.g. FTDI-based USB-RS232/RS422), never a direct wire to the Pi's pins.
 
 lasers:
+  - id: aglaser-ilm-150-r
+    name: AgLaser ILM-150-R
+    driver: ascii_number
+    rate_hz: 9
+    baud: 9600
+    interface: RS-232 at 9600 baud; USB-RS232 adapter (FTDI chip preferred)
+    max_range_m: 150
+    confidence: unverified
+    notes: >-
+      Measurement Devices Ltd IM150 laser module (also sold as the Carlson
+      ILM-R). 150 m on a 90% white target, 75 m on 18% grey, 0.5 m minimum;
+      10 cm accuracy, 9 Hz max; 905 nm, Class 1M; 9-24 V dc, under 5 W; IP67.
+      RS-232 9600 baud. The exact output line is not confirmed: AeroLab-Pi
+      reads the first number on each line as metres and keeps every raw byte,
+      so nothing is lost if the format differs. Check it on the bench with
+      scripts/probe.py. Fischer pin 5 is a "trigger out" (not on the DB9 lead):
+      possibly a per-measurement pulse for the Reach M2 time mark; unverified.
+    source: https://cdn.robotshop.com/media/m/mrp/rb-mrp-01/pdf/carlson_ilm-r.pdf
+    troubleshooting:
+      no_data:
+        - "It needs its own 9-24 V supply (red/black flying leads on the adaptor cable); the RS-232 lead carries no power."
+        - "RS-232 levels: connect through a USB-RS232 adapter, never to the Pi's GPIO pins."
+        - "DB9: data out is pin 2, data in pin 3, ground pin 5. A null-modem adapter in the chain swaps 2 and 3: try with or without it."
+        - "9600 baud. Run scripts/probe.py on the port to see exactly what it sends."
+      range:
+        - "Rated 150 m on white, 75 m on grey targets. Snow is bright, but above about 450 ft AGL expect no returns; fly laser legs lower."
+      spikes:
+        - "Check the window for frost, dirt or condensation; at altitude in cold air the window can ice."
+        - "Open water and glassy ice can return nothing or a weak, wrong range."
+
   - id: riegl-ld90-3800
     name: Riegl LD90-3800 (HiP-LR)
     driver: riegl_ld90
@@ -140,6 +170,51 @@ lasers:
     notes: First number on each line is the range in centimetres.
 
 gnss:
+  - id: emlid-reach-m2
+    name: Emlid Reach M2 (NMEA)
+    driver: nmea
+    rate_hz: 10
+    baud: 115200
+    interface: 3.3 V UART on the S1 port (pin 4 TX, pin 5 RX, pin 1 GND) to Pi pins 10/8, or USB
+    confidence: secondary
+    notes: >-
+      In Emlid Flow / ReachView set Position output: Serial, NMEA, 10 Hz,
+      115200 baud (GGA, RMC and ZDA). Also turn on raw data logging (UBX or
+      RINEX, 10 Hz) on the Reach: that internal log is the science-grade
+      position record for PPK; AeroLab-Pi's copy is for the live display and
+      the first match. PPS is on C1 or C2 pin 3 (wire to Pi GPIO 18 for
+      microsecond timing); time marks on C1/C2 pin 2 record camera exposures
+      in the raw log (active low). 3.3 V logic only.
+    source: https://github.com/emlid/emlid-docs/blob/master/docs/reach/m2/specs.md
+    troubleshooting:
+      no_data:
+        - "In Emlid Flow, check Position output is on, set to Serial (UART), NMEA, 115200 baud."
+        - "S1 pinout: 1 GND, 4 TX, 5 RX. Reach TX goes to Pi RX (pin 10), Reach RX to Pi TX (pin 8), grounds joined."
+        - "3.3 V logic: an RS-232 adapter on the S1 port can damage it and won't decode."
+        - "Over USB, the Reach shows up as several devices; pick the serial one in ./configure.sh."
+      no_fix:
+        - "The M2 needs a clear sky view and its antenna on a ground plane (aircraft skin or a 10 cm metal plate)."
+        - "Check the antenna cable is tight at both ends; in Emlid Flow the satellite bars should show signal."
+      low_rate:
+        - "Set the position output rate to 10 Hz (or 5 Hz) in Emlid Flow; the default can be 1 Hz."
+
+  - id: emlid-reach-m2-erb
+    name: Emlid Reach M2 (ERB binary)
+    driver: erb
+    rate_hz: 10
+    baud: 115200
+    interface: 3.3 V UART on the S1 port or USB
+    confidence: manual
+    notes: >-
+      Emlid Reach Binary: position, fix type, satellites, DOP and velocity with
+      checksums and GPS time. Emlid marks ERB deprecated; use it if your
+      firmware still offers it, otherwise NMEA. Raw logging and PPS as for NMEA.
+    source: https://files.emlid.com/erb/ERB-0.1.0-v7.pdf
+    troubleshooting:
+      no_data:
+        - "In Emlid Flow set Position output: Serial, ERB, 115200 baud. If ERB is not offered on your firmware, use the NMEA preset."
+        - "S1 pinout: 1 GND, 4 TX, 5 RX; 3.3 V logic."
+
   - id: ublox-zed-f9p
     name: u-blox ZED-F9P (RTK)
     driver: nmea
@@ -274,6 +349,11 @@ gnss:
     notes: Any receiver sending GGA. Check its baud.
 
 attitude:
+  - id: none-post
+    name: No attitude sensor (attitude applied in post-processing)
+    driver: none
+    notes: The display shows laser AGL without tilt correction.
+
   - id: from-gnss
     name: From the GNSS/INS above (no separate sensor)
     driver: none
@@ -340,6 +420,33 @@ payloads:
       corrections use the INS trajectory).
     source: https://par.nsf.gov/servlets/purl/10629665
 
+  - id: micasense-rededge-p
+    name: MicaSense RedEdge-P (trigger pin)
+    kind: camera
+    trigger: gpio
+    pulse_width_ms: 20
+    active_high: true
+    max_hz: 3
+    confidence: secondary
+    notes: >-
+      Set a host GPIO (COMM pins 11-13) to Trigger input, rising edge, in the
+      camera's web page. 3.3 V nominal input, so the Pi output works directly;
+      join grounds. At most 3 captures/s (CFexpress card). For exact exposure
+      times, set another GPIO to "Top of Frame output", active low, and wire it
+      to the Reach M2 time mark (C1 pin 2): every exposure lands in the
+      Reach's raw log on GPS time.
+    source: https://support.micasense.com/hc/article_attachments/4414659533207
+
+  - id: micasense-rededge-p-http
+    name: MicaSense RedEdge-P (HTTP capture over Ethernet)
+    kind: camera
+    trigger: http
+    http_url: http://192.168.1.83/capture
+    max_hz: 3
+    confidence: manual
+    notes: No trigger wire; capture requests over Ethernet (default 192.168.1.83). More timing jitter than a wired trigger.
+    source: http://micasense.github.io/rededge-api/api/http.html
+
   - id: micasense-altum-pt
     name: MicaSense Altum-PT / RedEdge-P (trigger pin)
     kind: camera
@@ -393,7 +500,26 @@ payloads:
 
 profiles:
   - id: airborne-snow-survey
-    name: Airborne snow survey, light aircraft (snow radar + laser + multispectral + GNSS/INS)
+    name: "Airborne snow survey: Emlid Reach M2 + AgLaser ILM-150-R + RedEdge-P + snow radar"
+    gnss: emlid-reach-m2
+    attitude: none-post
+    laser: aglaser-ilm-150-r
+    payloads: [cresis-snow-radar, micasense-rededge-p]
+    trigger_hz: 1.0
+    survey_agl_ft: 350
+    low_agl_warn_ft: 250
+    notes: >-
+      Reach M2 for position and time (raw logging on the Reach for PPK), the
+      ILM-150-R laser at 9 Hz, a RedEdge-P triggered once a second, and the
+      2-8 GHz snow radar recording on its own GPS. Attitude and georeferencing
+      are applied in post-processing, so the live AGL is not tilt-corrected.
+      The ILM-150-R is rated to 150 m (75 m on dark targets): plan laser legs at
+      about 350 ft AGL; above roughly 450 ft expect dropouts, and at the
+      2000-2500 ft radar height it will read nothing.
+      Every laser reading and every GNSS byte is logged with timestamps.
+
+  - id: long-range-survey
+    name: Long-range laser survey (Riegl LD90-3800 + VectorNav VN-200)
     gnss: vectornav-vn200
     attitude: from-gnss
     laser: riegl-ld90-3800
@@ -402,11 +528,9 @@ profiles:
     survey_agl_ft: 2250
     low_agl_warn_ft: 1500
     notes: >-
-      An estimate for a light-aircraft ice survey at 2000-2500 ft AGL: GNSS/INS
-      for position and attitude, a long-range laser altimeter, a 2-8 GHz snow
-      radar recording on its own GPS, and a multispectral camera triggered
-      once a second. At that height, short-range lidars (SF11, TF03, GRF-500)
-      read nothing; plan on a laser rated past 760 m.
+      For laser data at 2000-2500 ft AGL: GNSS/INS position and attitude and a
+      laser rated to 2500 m. Short-range lidars (SF11, TF03, GRF-500, ILM-150)
+      read nothing at that height.
 
   - id: survey-budget
     name: Survey on a budget (u-blox RTK + BNO085 + TF03 + MicaSense)

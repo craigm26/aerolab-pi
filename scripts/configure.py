@@ -181,7 +181,8 @@ def build_config(base: dict, answers: dict, catalog: dict | None = None) -> dict
     if att_dev:
         if att_dev["driver"] == "none":
             src = gnss_dev or by_id(catalog["gnss"]).get((cfg.get("gnss") or {}).get("device", ""), {})
-            label = (src.get("name", "GNSS/INS").split(" (")[0]) + " attitude"
+            label = ((src.get("name", "GNSS/INS").split(" (")[0]) + " attitude" if att_dev["id"] == "from-gnss"
+                     else "No attitude sensor")
             cfg["imu_ahrs"] = {"device": att_dev["id"], "name": label, "enabled": False, "port": "none"}
         else:
             cfg["imu_ahrs"] = apply_device(cfg.get("imu_ahrs", {}), att_dev)
@@ -224,6 +225,12 @@ def build_config(base: dict, answers: dict, catalog: dict | None = None) -> dict
     if "trigger.http_url" in answers and ps.get("method") == "http":
         ps["http_url"] = answers["trigger.http_url"]
 
+    if "pps.pin" in answers:
+        t = cfg.setdefault("timing", {})
+        t["pps_pin"] = int(answers["pps.pin"]) if answers["pps.pin"] else None
+        t["pps_device"] = "pps0" if answers["pps.pin"] else ""
+    if "mirror_dirs" in answers:
+        cfg["logging"]["mirror_dirs"] = list(answers["mirror_dirs"])
     if "ssd.mount" in answers:
         cfg["logging"]["primary_dir"] = str(Path(answers["ssd.mount"]) / "aerolab_logs")
     if "server.port" in answers:
@@ -415,6 +422,24 @@ def ask_baud(ui, label: str, current) -> str:
     return ui.menu(f"{label} baud rate (Enter keeps the preset):", items, default=str(current))
 
 
+def port_check(port: str, baud: int, dev: dict) -> str:
+    """Listen briefly at the preset baud; if that fails, try every baud. Plain-language result."""
+    sys.path.insert(0, str(ROOT / "scripts"))
+    import probe
+    res = probe.probe(port, [baud], 2.5)
+    if "error" not in res:
+        r = res["results"][0]
+        want = dev.get("driver")
+        if r["good"] >= 3 and r["good"] > 3 * r["bad"]:
+            ok_driver = r["best"] == want or (want in ("ascii_number", "riegl_ld90") and r["best"] in ("ascii_number", "riegl_ld90"))
+            if ok_driver:
+                return f"OK: {port} at {baud} baud is sending {want} data ({r['good']} good readings in 2.5 s)."
+            return (f"Data arrives at {baud} baud, but it looks like {r['best']}, not {want}. "
+                    f"Check you picked the right device for this port.")
+    res = probe.probe(port, probe.BAUDS, 1.0)
+    return "Nothing usable at the preset baud. Full scan:\n\n" + probe.verdict(res)
+
+
 def ask_device(ui, title: str, devices: list[dict], default: str) -> dict:
     items = [(d["id"], device_label(d)) for d in devices]
     pick = ui.menu(title, items, default=default)
@@ -465,7 +490,7 @@ def interview(ui, base: dict, catalog: dict | None = None) -> tuple[dict, dict]:
     gnss = ask_device(ui, "GNSS receiver or GNSS/INS:", catalog["gnss"], a["gnss.device"])
     a["gnss.device"] = gnss["id"]
     att_default = "from-gnss" if gnss.get("provides_attitude") else (
-        a["attitude.device"] if a["attitude.device"] != "from-gnss" else "bno085-rvc")
+        a["attitude.device"] if a["attitude.device"] != "from-gnss" else "none-post")
     att = ask_device(ui, "Attitude source (roll, pitch, heading):", catalog["attitude"], att_default)
     a["attitude.device"] = att["id"]
     laser = ask_device(ui, "Laser altimeter:", catalog["lasers"], a["laser.device"])
@@ -484,6 +509,10 @@ def interview(ui, base: dict, catalog: dict | None = None) -> tuple[dict, dict]:
             a[f"{key}.port"] = ask_port(ui, label, dev.get("interface", ""), suggested, ports)
             taken.add(a[f"{key}.port"])
             a[f"{key}.baud"] = ask_baud(ui, dev["name"], dev.get("baud", 115200))
+            if os.path.exists(a[f"{key}.port"]) and ui.yesno(
+                    f"Listen on {a[f'{key}.port']} for a few seconds to check the {label} is there and talking?",
+                    default_yes=True):
+                ui.info(port_check(a[f"{key}.port"], int(a[f"{key}.baud"]), dev))
         a["laser.offset"] = ask_number(
             ui, "Laser mounting offset in metres: vertical distance from the laser lens down to the wheels "
                 "or belly. The display reads 0 on the ground when this is right.",
@@ -512,11 +541,28 @@ def interview(ui, base: dict, catalog: dict | None = None) -> tuple[dict, dict]:
     if gpio or http:
         a["trigger.hz"] = ask_number(ui, "Trigger pulses per second:", a["trigger.hz"], 0.1, 10)
 
+    # Timing
+    if mode == "live" and ui.yesno(
+            "Is the GNSS PPS (pulse-per-second) output wired to the Pi?\n\n"
+            "Reach M2: C1 or C2 pin 3 to a Pi GPIO, grounds joined. It puts every timestamp on GPS time to "
+            "microseconds. Without it, timing comes from GNSS epoch times (milliseconds).",
+            default_yes=bool((base.get("timing") or {}).get("pps_device"))):
+        a["pps.pin"] = ui.menu("Which GPIO is PPS wired to? (BCM number)",
+                               [(p, "physical pin " + str(BCM_TO_PHYSICAL.get(p, "?"))) for p in ["18"] + TRIGGER_PINS
+                                if p != str(base["payload_sync"].get("gpio_pin", 17))],
+                               default=str((base.get("timing") or {}).get("pps_pin", 18)))
+    else:
+        a["pps.pin"] = ""
+
     # Logging and display
     mount = str(Path(base["logging"]["primary_dir"]).parent)
     a["ssd.mount"] = ui.text(
         "Where is the USB SSD mounted? Flight logs go there when it is mounted,\n"
         "otherwise to ./logs on the SD card.", mount)
+    mirrors = (base["logging"].get("mirror_dirs") or [])
+    m = ui.text("Mirror the raw sensor data to a second drive too? Enter its folder (e.g. /mnt/usb2/aerolab_mirror), "
+                "or leave empty for no mirror.", mirrors[0] if mirrors else "")
+    a["mirror_dirs"] = [m.strip()] if m.strip() else []
     a["hud.low_agl_ft"] = ask_number(ui, "Turn the AGL readout amber below how many feet?",
                                      a["hud.low_agl_ft"], 0, 20000)
     a["server.port"] = ask_number(ui, "Web port for the cockpit display:", base["server"]["port"], 1024, 65535)
@@ -612,6 +658,9 @@ def needs_extras(cfg: dict) -> list[str]:
     out = []
     if any((cfg.get(s) or {}).get("driver") == "mavlink" for s in ("gnss", "imu_ahrs")):
         out.append("pymavlink")
+    t = cfg.get("timing") or {}
+    if t.get("pps_device") and t.get("pps_pin") is not None:
+        out.append(f"pps:{t['pps_pin']}")
     b = cfg.get("buddy") or {}
     if b.get("ai") and b.get("model"):
         out.append(f"ollama:{b['model']}")

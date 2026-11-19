@@ -96,21 +96,30 @@ def test_sim_mode_skips_port_questions():
     assert answers["profile"] == "airborne-snow-survey" and extras == {}
 
 
-def test_default_interview_prefills_snow_survey_and_warns_nothing_for_riegl():
+def test_default_interview_prefills_the_real_snow_survey_setup():
     ui = ScriptedUI()
     answers, _ = configure.interview(ui, BASE)
     cfg = configure.build_config(BASE, answers)
-    assert cfg["gnss"]["driver"] == "vectornav_ins" and cfg["gnss"]["baud"] == 115200
-    assert cfg["imu_ahrs"]["enabled"] is False                  # attitude comes from the VN-200
-    assert cfg["laser_altimeter"]["driver"] == "riegl_ld90" and cfg["laser_altimeter"]["baud"] == 4800
-    assert [p["id"] for p in cfg["payloads"]] == ["cresis-snow-radar", "micasense-altum-pt"]
+    assert cfg["gnss"]["device"] == "emlid-reach-m2" and cfg["gnss"]["driver"] == "nmea"
+    assert cfg["gnss"]["baud"] == 115200 and cfg["gnss"]["rate_hz"] == 10
+    assert cfg["laser_altimeter"]["device"] == "aglaser-ilm-150-r"
+    assert cfg["laser_altimeter"]["baud"] == 9600 and cfg["laser_altimeter"]["max_range_m"] == 150
+    assert cfg["imu_ahrs"]["enabled"] is False and cfg["imu_ahrs"]["name"] == "No attitude sensor"
+    assert [p["id"] for p in cfg["payloads"]] == ["cresis-snow-radar", "micasense-rededge-p"]
     assert cfg["payload_sync"]["enabled"] and cfg["payload_sync"]["method"] == "gpio"
-    assert cfg["hud"]["survey_agl_ft"] == 2250
+    assert cfg["hud"]["survey_agl_ft"] == 350
     assert not any(q.startswith("Laser range check") for q in ui.asked)
 
 
+def test_ilm150_at_radar_height_warns():
+    ui = ScriptedUI({"Planned survey height": "2250"})
+    configure.interview(ui, BASE)
+    warn = [q for q in ui.asked if q.startswith("Laser range check")]
+    assert warn and "ILM-150-R" in warn[0] and "read nothing" in warn[0]
+
+
 def test_short_range_laser_at_survey_height_warns():
-    ui = ScriptedUI({"Laser altimeter:": "benewake-tf03-180"})
+    ui = ScriptedUI({"Laser altimeter:": "benewake-tf03-180", "Planned survey height": "2250"})
     configure.interview(ui, BASE)
     warn = [q for q in ui.asked if q.startswith("Laser range check")]
     assert warn and "read nothing" in warn[0]
@@ -154,7 +163,7 @@ def test_every_profile_builds_a_config_the_daemon_accepts(tmp_path):
                 if main.section_enabled(cfg, sec):
                     assert c["driver"] in drivers.DRIVERS, (prof["id"], sec)
             d = main.AeroLabDaemon(cfg, sim_mode=mode == "sim")
-            assert d.buddy.configured["imu"], prof["id"]      # attitude always has a source
+            assert d.buddy.configured["imu"] == (prof["attitude"] != "none-post"), prof["id"]
 
 
 def test_written_config_loads_in_daemon(tmp_path):

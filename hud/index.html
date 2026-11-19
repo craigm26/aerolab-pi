@@ -118,6 +118,14 @@
     .ask input { flex: 1; min-width: 0; background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 10px; font: inherit; font-size: 16px; }
     .ask button { background: var(--accent); color: #000; border: none; border-radius: 6px; padding: 0 14px; font-weight: 900; }
     .note { color: var(--muted); font-size: 0.72rem; line-height: 1.4; }
+    .ready-box { border-radius: 8px; padding: 10px 12px; font-weight: 800; letter-spacing: 0.5px; }
+    .ready-box.green { background: #062b17; color: var(--ok); border: 1px solid var(--ok); }
+    .ready-box.amber { background: #2b2006; color: var(--warn); border: 1px solid var(--warn); }
+    .ready-box.red { background: #2a0d05; color: #fff; border: 1px solid var(--err); }
+    .fnd { background: var(--panel); border-left: 4px solid var(--border); border-radius: 6px; padding: 8px 10px; font-size: 0.82rem; }
+    .fnd.blocker { border-left-color: var(--err); } .fnd.warn { border-left-color: var(--warn); } .fnd.info { border-left-color: var(--accent); }
+    .fnd .ev { color: var(--muted); font-size: 0.75rem; margin: 2px 0 4px; }
+    .fnd ol { margin: 4px 0 0 18px; color: #c9d1d9; } .fnd li { margin: 2px 0; }
     .sect { color: var(--accent); font-size: 0.75rem; letter-spacing: 2px; font-weight: 800; margin-top: 6px; }
     .htab { width: 100%; border-collapse: collapse; font-size: 0.8rem; }
     .htab td, .htab th { padding: 6px 4px; border-bottom: 1px solid var(--border); text-align: left; }
@@ -220,7 +228,7 @@
 
   <div class="main-grid">
     <div class="card">
-      <div class="agl-label">TILT-CORRECTED AGL</div>
+      <div class="agl-label" id="agl-label">TILT-CORRECTED AGL</div>
       <div id="agl-ft" class="agl-value">---</div>
       <div class="agl-unit">FEET</div>
       <div class="agl-sub"><span id="agl-m">--.-</span> m &nbsp;|&nbsp; RAW: <span id="raw-m">--.-</span> m</div>
@@ -228,14 +236,15 @@
     </div>
 
     <div class="card">
-      <div class="horizon-box">
+      <div class="horizon-box" id="horizon">
         <div id="ground" class="ground"></div>
         <div class="wings"></div>
+        <div id="noatt" style="display:none;position:absolute;inset:0;align-items:center;justify-content:center;text-align:center;font-size:0.7rem;font-weight:800;color:var(--muted);background:rgba(0,0,0,0.55);z-index:3;letter-spacing:1px">NO ATTITUDE<br>SENSOR</div>
       </div>
       <div class="metrics">
         <div class="metric"><span>ROLL</span><strong id="roll">0.0°</strong></div>
         <div class="metric"><span>PITCH</span><strong id="pitch">0.0°</strong></div>
-        <div class="metric"><span>HDG</span><strong id="yaw">000°</strong></div>
+        <div class="metric"><span id="yaw-label">HDG</span><strong id="yaw">000°</strong></div>
         <div class="metric"><span id="msl-label">MSL</span><strong id="msl">0 m</strong></div>
       </div>
     </div>
@@ -273,6 +282,12 @@
     </div>
 
     <div class="pane" id="pane-check">
+      <div class="ready-box amber" id="readybox">Checking...</div>
+      <div id="findings" style="display:flex;flex-direction:column;gap:6px"></div>
+      <div class="sect">SCIENCE DATA</div>
+      <div id="datastat" class="note" style="font-size:0.8rem;color:#c9d1d9"></div>
+      <div class="note"><a href="/report" target="_blank" style="color:var(--accent)">Open the readiness report</a> (also saved in the log folder for every flight).</div>
+      <div class="sect">GROUND CHECK</div>
       <button class="toggle" id="run-check">RUN GROUND CHECK</button>
       <div class="note">Run on the ramp before engine start. Uses the live data: the laser should read about 0 m AGL on the ground, which confirms the mounting offset.</div>
       <div id="checklist" style="display:flex;flex-direction:column;gap:6px"></div>
@@ -336,7 +351,7 @@
       done: false,
       rows: [
         ["LINK", "link"], ["GNSS", "gnss"], ["LASER", "laser"], ["ATTITUDE", "imu"],
-        ["LOGGER", "log"], ["TRIGGER", "trig"], ["CALIBRATION", "cal"], ["BUDDY", "buddy"], ["SELF-TEST", "bit"],
+        ["LOGGER", "log"], ["TIMING", "time"], ["TRIGGER", "trig"], ["CALIBRATION", "cal"], ["BUDDY", "buddy"], ["SELF-TEST", "bit"],
       ],
       init() {
         const word = "AEROLAB-PI";
@@ -388,12 +403,17 @@
           : this.waitOr("gnss", "err", "NO DATA"));
         step(2, () => !cfgd.laser ? this.set("laser", "off", "NOT FITTED")
           : d.laser_ok ? this.set("laser", "ok", `${d.laser_raw_m.toFixed(1)} M`) : this.waitOr("laser", "err", "NO DATA"));
-        step(3, () => !cfgd.imu ? this.set("imu", "off", "NOT FITTED")
+        step(3, () => !cfgd.imu ? this.set("imu", "off", "NONE · POST-PROCESSED")
           : d.imu_ok ? this.set("imu", "ok", `ROLL ${d.roll_deg.toFixed(0)}° PITCH ${d.pitch_deg.toFixed(0)}°`) : this.waitOr("imu", "err", "NO DATA"));
         step(4, () => d.logging_active
           ? this.set("log", d.sim_mode ? "warn" : (/\/mnt\/|\/media\//.test(d.log_dir) ? "ok" : "warn"),
                      d.sim_mode ? "SIM LOGS" : (/\/mnt\/|\/media\//.test(d.log_dir) ? "SSD" : "SD CARD"))
           : this.waitOr("log", "err", "NOT WRITING"));
+        step(4.5, () => {
+          const p = (d._data || {}).pps || {};
+          p.enabled ? (p.ok ? this.set("time", "ok", `PPS · ${Number(p.clock_offset_ms).toFixed(2)} MS`) : this.set("time", "warn", "PPS: NO PULSES"))
+                    : this.set("time", "off", d.gnss_time_offset_s != null ? `GNSS TIME · ${Number(d.gnss_time_offset_s).toFixed(1)} S` : "GNSS EPOCH TIME");
+        });
         step(5, () => d.trigger_count > 0 ? this.set("trig", d.gpio_live ? "ok" : "warn", d.gpio_live ? "PULSING" : "NO GPIO")
           : this.set("trig", "off", "OFF"));
         step(6, () => {
@@ -468,9 +488,13 @@
 
       $("agl-m").textContent = d.agl_m.toFixed(1);
       $("raw-m").textContent = d.laser_raw_m.toFixed(1);
-      $("roll").textContent = `${d.roll_deg.toFixed(1)}°`;
-      $("pitch").textContent = `${d.pitch_deg.toFixed(1)}°`;
-      $("yaw").textContent = `${String(Math.round(d.yaw_deg) % 360).padStart(3, "0")}°`;
+      const hasAtt = (d._configured || {}).imu !== false;
+      $("noatt").style.display = hasAtt ? "none" : "flex";
+      $("roll").textContent = hasAtt ? `${d.roll_deg.toFixed(1)}°` : "—";
+      $("pitch").textContent = hasAtt ? `${d.pitch_deg.toFixed(1)}°` : "—";
+      const hdg = hasAtt ? d.yaw_deg : d.track_deg;   // no attitude sensor: show GNSS track instead
+      $("yaw-label").textContent = hasAtt ? "HDG" : "TRK (GNSS)";
+      $("yaw").textContent = `${String(Math.round(hdg) % 360).padStart(3, "0")}°`;
       $("msl").textContent = `${Math.round(d.alt_msl_m)} m`;
       $("msl-label").textContent = d.alt_ref || "MSL";
 
@@ -499,6 +523,8 @@
       $("agl-badges").innerHTML = badges.join("");
       renderHealth(d);
       renderCal(d);
+      renderReady(d);
+      $("agl-label").textContent = (d._configured || {}).imu === false ? "LASER AGL · NOT TILT-CORRECTED" : "TILT-CORRECTED AGL";
       $("flightinfo").textContent = `Flight ${d.flight_id}`;
       const ai = d._ai || {};
       $("b-ai").textContent = ai.available ? `Local AI: ${ai.model}` : `Rules only (${ai.reason || "no AI model"})`;
@@ -553,7 +579,7 @@
     document.querySelectorAll(".tab").forEach((tab) => tab.onclick = () => {
       document.querySelectorAll(".tab").forEach((t) => t.classList.toggle("on", t === tab));
       document.querySelectorAll(".pane").forEach((p) => p.classList.toggle("on", p.id === tab.dataset.pane));
-      if (tab.dataset.pane === "pane-check") runCheck();
+      if (tab.dataset.pane === "pane-check") { runCheck(); lastFindingsKey = ""; loadFindings(); }
     });
 
     function renderHealth(d) {
@@ -569,6 +595,33 @@
         `<div class="chk ${i.status}"><b>${i.status.toUpperCase()}</b><span>${esc(i.item)}</span><span class="d">${esc(i.detail)}</span></div>`).join("")
         : `<div class="note">Running (needs a few seconds of sensor data)...</div>`;
     }
+
+    let lastFindingsKey = "";
+    function renderReady(d) {
+      const r = d._ready || {};
+      const box = $("readybox");
+      box.className = "ready-box " + (r.level || "amber");
+      box.textContent = r.text || "Checking...";
+      const x = d._data || {};
+      const raw = Object.entries(x.raw || {}).map(([k, v]) => `${k} ${(v.bytes / 1024).toFixed(0)} KB${v.errors ? ` (${v.errors} errors)` : ""}`).join(", ");
+      const pps = x.pps || {};
+      $("datastat").innerHTML = `${(x.readings_written || 0).toLocaleString()} readings saved · ${x.queued || 0} waiting · ${x.dropped || 0} lost<br>` +
+        `Raw capture: ${esc(raw || "none yet")}<br>` +
+        `Mirror: ${esc((x.mirrors || []).join(", ") || "none")} · PPS: ${esc(pps.enabled ? pps.detail : "not wired")}`;
+    }
+    async function loadFindings() {
+      try {
+        const r = await (await fetch("/api/diagnose")).json();
+        const key = JSON.stringify(r.findings.map((f) => f.title));
+        if (key === lastFindingsKey) return;
+        lastFindingsKey = key;
+        $("findings").innerHTML = r.findings.length ? r.findings.map((f) =>
+          `<div class="fnd ${f.severity}"><b>${esc(f.title)}</b>${f.evidence ? `<div class="ev">${esc(f.evidence)}</div>` : ""}` +
+          `<ol>${f.steps.map((x) => `<li>${esc(x)}</li>`).join("")}</ol></div>`).join("")
+          : `<div class="note">Nothing to fix.</div>`;
+      } catch {}
+    }
+    setInterval(() => { if ($("buddy").classList.contains("open")) loadFindings(); }, 3000);
 
     let capWasDone = false;
     function renderCal(d) {

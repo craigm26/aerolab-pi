@@ -133,7 +133,8 @@ def enc_pashr(ts, roll, pitch, yaw) -> bytes:
 def enc_vnins(ts, tr, roll, pitch, yaw) -> bytes:
     vn = tr["gs"] * math.cos(math.radians(tr["track"]))
     ve = tr["gs"] * math.sin(math.radians(tr["track"]))
-    return _nmea(f"VNINS,{ts % 604800:.3f},2290,0006,{yaw:+08.3f},{pitch:+07.3f},{roll:+08.3f},"
+    tow = (ts - 315964800 + drivers.GPS_UTC_LEAP_S) % 604800        # GPS time of week
+    return _nmea(f"VNINS,{tow:.3f},2290,0006,{yaw:+08.3f},{pitch:+07.3f},{roll:+08.3f},"
                  f"{tr['lat']:+012.8f},{tr['lon']:+013.8f},{tr['alt_msl']:+010.3f},"
                  f"{vn:+08.3f},{ve:+08.3f},+000.000,0.5,1.0,0.1")
 
@@ -214,6 +215,7 @@ class VirtualDevice:
         self.spikes = 0
         self.mav = MavEnc() if driver == "mavlink" else None
         self.received = bytearray()       # commands the daemon sent (init / poll)
+        self.sent_log: list[tuple[float, bool]] = []   # (send time, corrupted) for completeness checks
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.reader = threading.Thread(target=self._drain, daemon=True)
 
@@ -293,8 +295,11 @@ class VirtualDevice:
         period = 1.0 / self.rate
         nxt = time.monotonic()
         while not self.stop.is_set():
+            t = time.time()
+            c0 = self.corrupted
             try:
-                os.write(self.master, self.frame(time.time()))
+                os.write(self.master, self.frame(t))
+                self.sent_log.append((t, self.corrupted != c0))
             except OSError:
                 pass
             self.frames += 1

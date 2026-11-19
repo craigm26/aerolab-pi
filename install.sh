@@ -43,6 +43,9 @@ if command -v raspi-config >/dev/null 2>&1; then
   fi
 fi
 
+# Free the serial ports for the setup questions (a reinstall over a running service).
+sudo systemctl stop aerolab.service 2>/dev/null || true
+
 # Setup questions. Without a terminal (e.g. piped install) fall back to defaults.
 if [[ -z "$CONFIG_ARGS" && ! -t 0 ]]; then
   CONFIG_ARGS="--defaults"
@@ -57,10 +60,32 @@ else
   }
 fi
 
+# USB-serial adapters: FTDI chips buffer up to 16 ms by default, which smears timestamps.
+# This rule sets 1 ms on every FTDI port as it appears. (CP210x/CH340/PL2303 have no such setting.)
+echo 'ACTION=="add", SUBSYSTEM=="usb-serial", DRIVERS=="ftdi_sio", ATTR{latency_timer}="1"' \
+  | sudo tee /etc/udev/rules.d/99-aerolab-ftdi-latency.rules > /dev/null
+sudo udevadm control --reload-rules && sudo udevadm trigger --subsystem-match=usb-serial || true
+
 # Extras the chosen hardware needs.
 NEEDS="$("$APP_DIR/.venv/bin/python" "$APP_DIR/scripts/configure.py" --needs)"
 if grep -qx pymavlink <<<"$NEEDS"; then
   "$APP_DIR/.venv/bin/pip" install pymavlink
+fi
+PPS_PIN="$(grep '^pps:' <<<"$NEEDS" | cut -d: -f2 || true)"
+if [[ -n "$PPS_PIN" ]]; then
+  BOOTCFG=/boot/firmware/config.txt; [[ -f $BOOTCFG ]] || BOOTCFG=/boot/config.txt
+  if grep -q "Raspberry Pi 5" /proc/device-tree/model 2>/dev/null; then
+    OVERLAY="dtoverlay=pps-rp1,pin=$PPS_PIN"
+  else
+    OVERLAY="dtoverlay=pps-gpio,gpiopin=$PPS_PIN"
+  fi
+  if ! grep -qxF "$OVERLAY" "$BOOTCFG"; then
+    sudo sed -i '/^dtoverlay=pps-\(rp1\|gpio\)/d' "$BOOTCFG"
+    echo "$OVERLAY" | sudo tee -a "$BOOTCFG" > /dev/null
+    NEEDS_REBOOT=1
+    echo "PPS: added '$OVERLAY' to $BOOTCFG"
+  fi
+  sudo apt-get install -y pps-tools > /dev/null || true
 fi
 MODEL="$(grep '^ollama:' <<<"$NEEDS" | cut -d: -f2- || true)"
 if [[ -n "$MODEL" ]]; then
@@ -78,13 +103,19 @@ Description=AeroLab-Pi flight telemetry and cockpit HUD
 After=network.target time-sync.target
 
 [Service]
-Type=simple
+# notify + watchdog: the daemon pings systemd every 5 s while all its tasks are alive;
+# if one wedges, systemd restarts it within 60 s and logging resumes in the same database.
+Type=notify
+NotifyAccess=main
+WatchdogSec=60
 User=$RUN_USER
 WorkingDirectory=$APP_DIR
 Environment=PYTHONUNBUFFERED=1
 ExecStart=$APP_DIR/.venv/bin/python $APP_DIR/daemon/main.py --config $APP_DIR/config/sensors.local.yaml
 Restart=always
 RestartSec=2
+# Restart forever, however often it fails (a flight must not end in a "start limit hit").
+StartLimitIntervalSec=0
 
 [Install]
 WantedBy=multi-user.target
