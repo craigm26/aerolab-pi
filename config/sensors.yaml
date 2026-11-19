@@ -1,0 +1,35 @@
+# AeroLab-Pi hardware and flight configuration
+
+server:
+  host: "0.0.0.0"
+  port: 8000
+  hud_hz: 10
+
+gnss:
+  port: "/dev/ttyAMA0"      # Pi hardware UART, or /dev/ttyACM0 for a USB GNSS
+  baud: 9600
+
+laser_altimeter:
+  port: "/dev/ttyUSB0"
+  baud: 115200
+  mounting_offset_m: 0.4    # vertical distance from the laser to the wheels/belly
+  unit: "m"                 # "m" or "cm", whatever the sensor prints
+
+imu_ahrs:
+  port: "/dev/ttyUSB1"
+  baud: 115200              # expects CSV lines: roll_deg,pitch_deg,yaw_deg
+
+payload_sync:
+  enabled: true
+  gpio_pin: 17              # BCM pin for the hardware trigger (snow radar / multispectral camera)
+  trigger_hz: 1.0           # pulses per second
+  pulse_width_ms: 20
+
+logging:
+  primary_dir: "/mnt/ssd/aerolab_logs"   # used only when /mnt/ssd is a mounted drive
+  fallback_dir: "./logs"
+  rotate_minutes: 5         # new CSV file every 5 minutes to limit power-loss exposure
+  log_hz: 5
+
+hud:
+  low_agl_warn_ft: 200      # AGL readout turns amber below this

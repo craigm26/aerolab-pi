@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black" />
+  <title>AeroLab HUD</title>
+  <!-- No external dependencies: works fully offline on the cockpit Wi-Fi. -->
+  <style>
+    :root {
+      --bg: #000000;
+      --panel: #111418;
+      --border: #262c36;
+      --text: #f0f4f8;
+      --muted: #8b949e;
+      --ok: #00e676;
+      --warn: #ffb300;
+      --err: #ff3d00;
+      --accent: #00e5ff;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    html, body { background: var(--bg); }
+    body { color: var(--text); height: 100vh; height: 100dvh; display: flex; flex-direction: column; padding: 12px; gap: 12px; overflow: hidden; }
+
+    #banner { display: none; background: var(--err); color: #fff; text-align: center; font-weight: 800; padding: 8px; border-radius: 6px; letter-spacing: 1px; }
+    #banner.show { display: block; }
+    #simtag { display: none; background: var(--warn); color: #000; text-align: center; font-weight: 800; padding: 4px; border-radius: 6px; letter-spacing: 2px; font-size: 0.8rem; }
+    #simtag.show { display: block; }
+
+    .status-bar { display: flex; gap: 8px; flex-wrap: wrap; justify-content: space-between; }
+    .pill { flex: 1; min-width: 90px; background: var(--panel); border: 2px solid var(--border); border-radius: 8px; padding: 8px; text-align: center; font-size: 0.85rem; font-weight: 700; }
+    .pill.ok { border-color: var(--ok); color: var(--ok); }
+    .pill.err { border-color: var(--err); color: var(--err); }
+    .pill.warn { border-color: var(--warn); color: var(--warn); }
+
+    .main-grid { flex: 1; display: grid; grid-template-columns: 2fr 1fr; gap: 12px; min-height: 0; }
+    @media (max-width: 700px) {
+      body { overflow-y: auto; height: auto; min-height: 100vh; }
+      .main-grid { grid-template-columns: 1fr; }
+    }
+
+    .card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 16px; display: flex; flex-direction: column; justify-content: center; align-items: center; }
+    .agl-label { font-size: 1.1rem; color: var(--accent); letter-spacing: 2px; font-weight: 700; }
+    .agl-value { font-size: clamp(4.5rem, 15vw, 9rem); font-weight: 900; line-height: 1; margin: 8px 0; color: #ffffff; font-variant-numeric: tabular-nums; }
+    .agl-unit { font-size: 1.2rem; color: var(--muted); letter-spacing: 2px; }
+    .agl-sub { font-size: 1.2rem; color: var(--muted); margin-top: 8px; text-align: center; }
+    .agl-low { color: var(--warn) !important; }
+    .agl-stale { color: var(--err) !important; }
+
+    .horizon-box { width: 160px; height: 160px; border-radius: 50%; border: 3px solid var(--border); position: relative; overflow: hidden; background: #0d2238; margin-bottom: 12px; }
+    .ground { position: absolute; left: -50%; width: 200%; height: 150%; top: 50%; background: #4a3520; border-top: 2px solid #fff; transform-origin: 50% 0%; }
+    .wings { position: absolute; top: 50%; left: 50%; width: 70px; height: 4px; background: var(--warn); transform: translate(-50%, -50%); z-index: 2; }
+
+    .metrics { width: 100%; display: grid; grid-template-columns: 1fr 1fr; gap: 8px; font-size: 0.9rem; }
+    .metric { background: #090b0e; padding: 8px; border-radius: 6px; border: 1px solid var(--border); }
+    .metric span { display: block; color: var(--muted); font-size: 0.7rem; }
+    .metric strong { font-size: 1rem; }
+
+    .footer { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 4px 12px; font-size: 0.8rem; color: var(--muted); padding: 0 4px; }
+  </style>
+</head>
+<body>
+  <div id="banner" class="show">CONNECTING TO AEROLAB-PI...</div>
+  <div id="simtag">SIMULATED DATA, NOT A REAL FLIGHT</div>
+
+  <div class="status-bar">
+    <div id="p-gnss" class="pill err">GNSS</div>
+    <div id="p-laser" class="pill err">LASER</div>
+    <div id="p-imu" class="pill err">IMU</div>
+    <div id="p-log" class="pill err">LOG</div>
+    <div id="p-sync" class="pill">TRIG: 0</div>
+  </div>
+
+  <div class="main-grid">
+    <div class="card">
+      <div class="agl-label">TILT-CORRECTED AGL</div>
+      <div id="agl-ft" class="agl-value">---</div>
+      <div class="agl-unit">FEET</div>
+      <div class="agl-sub"><span id="agl-m">--.-</span> m &nbsp;|&nbsp; RAW: <span id="raw-m">--.-</span> m</div>
+    </div>
+
+    <div class="card">
+      <div class="horizon-box">
+        <div id="ground" class="ground"></div>
+        <div class="wings"></div>
+      </div>
+      <div class="metrics">
+        <div class="metric"><span>ROLL</span><strong id="roll">0.0°</strong></div>
+        <div class="metric"><span>PITCH</span><strong id="pitch">0.0°</strong></div>
+        <div class="metric"><span>HDG</span><strong id="yaw">000°</strong></div>
+        <div class="metric"><span>MSL</span><strong id="msl">0 m</strong></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="footer">
+    <div id="coords">LAT: --- | LON: ---</div>
+    <div id="logfile">LOG: ---</div>
+    <div id="utc">UTC: --:--:--</div>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const setPill = (id, state, text) => {
+      const el = $(id);
+      el.className = "pill " + state;
+      if (text) el.textContent = text;
+    };
+
+    let lastMsg = 0;
+
+    function connect() {
+      const proto = location.protocol === "https:" ? "wss" : "ws";
+      const ws = new WebSocket(`${proto}://${location.host}/ws`);
+      const banner = $("banner");
+
+      ws.onopen = () => banner.classList.remove("show");
+      ws.onclose = () => {
+        banner.textContent = "LINK LOST, RECONNECTING...";
+        banner.classList.add("show");
+        setTimeout(connect, 1000);
+      };
+      ws.onerror = () => ws.close();
+
+      ws.onmessage = (evt) => {
+        lastMsg = Date.now();
+        banner.classList.remove("show");
+        const d = JSON.parse(evt.data);
+
+        $("simtag").classList.toggle("show", !!d.sim_mode);
+
+        const agl = $("agl-ft");
+        agl.textContent = d.laser_ok ? Math.round(d.agl_ft) : "---";
+        agl.classList.toggle("agl-low", d.laser_ok && d.agl_ft < d.low_agl_warn_ft);
+        agl.classList.toggle("agl-stale", !d.laser_ok);
+
+        $("agl-m").textContent = d.agl_m.toFixed(1);
+        $("raw-m").textContent = d.laser_raw_m.toFixed(1);
+
+        $("roll").textContent = `${d.roll_deg.toFixed(1)}°`;
+        $("pitch").textContent = `${d.pitch_deg.toFixed(1)}°`;
+        $("yaw").textContent = `${String(Math.round(d.yaw_deg) % 360).padStart(3, "0")}°`;
+        $("msl").textContent = `${Math.round(d.alt_msl_m)} m`;
+
+        // Artificial horizon: ground moves down when nose pitches up.
+        const pitchPx = Math.max(-45, Math.min(45, d.pitch_deg * 2));
+        $("ground").style.transform = `translateY(${pitchPx}px) rotate(${-d.roll_deg}deg)`;
+
+        setPill("p-gnss", d.gnss_ok && d.gps_fix > 0 ? "ok" : (d.gnss_ok ? "warn" : "err"),
+                d.gnss_ok && d.gps_fix === 0 ? `NO FIX (${d.sats})` : `GNSS (${d.sats})`);
+        setPill("p-laser", d.laser_ok ? "ok" : "err", "LASER");
+        setPill("p-imu", d.imu_ok ? "ok" : "err", "IMU");
+        setPill("p-log", d.logging_active ? "ok" : "err", d.sim_mode ? "LOG (SIM)" : (d.logging_active ? "LOGGING" : "NOT LOGGING"));
+        setPill("p-sync", d.gpio_live ? "ok" : "warn", `TRIG: ${d.trigger_count}${d.gpio_live ? "" : " (NO GPIO)"}`);
+
+        $("coords").textContent = `LAT: ${d.lat.toFixed(5)} | LON: ${d.lon.toFixed(5)}`;
+        $("logfile").textContent = `LOG: ${d.log_file || "---"}`;
+        $("utc").textContent = `UTC: ${d.utc_iso ? d.utc_iso.slice(11, 19) : "--:--:--"}`;
+      };
+    }
+
+    // Socket open but no data (daemon wedged): say so instead of freezing the last number.
+    setInterval(() => {
+      if (lastMsg && Date.now() - lastMsg > 3000) {
+        $("banner").textContent = "NO DATA FROM AEROLAB-PI";
+        $("banner").classList.add("show");
+        $("agl-ft").textContent = "---";
+        $("agl-ft").classList.add("agl-stale");
+      }
+    }, 1000);
+
+    connect();
+  </script>
+</body>
+</html>
