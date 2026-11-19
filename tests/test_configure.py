@@ -44,7 +44,7 @@ def test_build_config_applies_answers_without_touching_base():
         "ssd.mount": "/media/flightssd", "hud.low_agl_ft": "500", "server.port": "8080",
     }
     cfg = configure.build_config(BASE, answers)
-    assert cfg["gnss"] == {"port": "/dev/serial0", "baud": 38400}
+    assert cfg["gnss"]["port"] == "/dev/serial0" and cfg["gnss"]["baud"] == 38400
     assert cfg["laser_altimeter"]["unit"] == "cm"
     assert cfg["laser_altimeter"]["mounting_offset_m"] == 0.55
     assert cfg["imu_ahrs"]["baud"] == 921600
@@ -54,33 +54,112 @@ def test_build_config_applies_answers_without_touching_base():
     assert BASE["gnss"]["port"] == "/dev/serial0"   # base untouched
 
 
-def test_sim_mode_skips_sensor_questions():
-    asked = []
+class ScriptedUI:
+    """Accepts every default; records what was asked."""
 
-    class FakeUI:
-        def menu(self, text, items, default=None):
-            asked.append(text)
-            return "sim" if text.startswith("How should") else default
-        def text(self, prompt, default):
-            asked.append(prompt)
-            return str(default)
-        def password(self, prompt):
-            return "x" * 10
-        def yesno(self, prompt, default_yes=True):
-            return False
-        def info(self, text):
-            pass
+    def __init__(self, picks=None):
+        self.asked, self.picks = [], picks or {}
 
-    answers, extras = configure.interview(FakeUI(), BASE)
+    def menu(self, text, items, default=None):
+        self.asked.append(text)
+        for k, v in self.picks.items():
+            if text.startswith(k):
+                return v
+        return default if default is not None else items[0][0]
+
+    def checklist(self, text, items, on):
+        self.asked.append(text)
+        return list(on)
+
+    def text(self, prompt, default):
+        self.asked.append(prompt)
+        for k, v in self.picks.items():
+            if prompt.startswith(k):
+                return v
+        return str(default)
+
+    def password(self, prompt):
+        return "x" * 10
+
+    def yesno(self, prompt, default_yes=True):
+        return False
+
+    def info(self, text):
+        self.asked.append(text)
+
+
+def test_sim_mode_skips_port_questions():
+    ui = ScriptedUI({"How should": "sim"})
+    answers, extras = configure.interview(ui, BASE)
     assert answers["mode"] == "sim"
-    assert not any("port is the" in q for q in asked)
-    assert answers["trigger.enabled"] is False and extras == {}
+    assert not any("port is the" in q for q in ui.asked)
+    assert answers["profile"] == "airborne-snow-survey" and extras == {}
+
+
+def test_default_interview_prefills_snow_survey_and_warns_nothing_for_riegl():
+    ui = ScriptedUI()
+    answers, _ = configure.interview(ui, BASE)
+    cfg = configure.build_config(BASE, answers)
+    assert cfg["gnss"]["driver"] == "vectornav_ins" and cfg["gnss"]["baud"] == 115200
+    assert cfg["imu_ahrs"]["enabled"] is False                  # attitude comes from the VN-200
+    assert cfg["laser_altimeter"]["driver"] == "riegl_ld90" and cfg["laser_altimeter"]["baud"] == 4800
+    assert [p["id"] for p in cfg["payloads"]] == ["cresis-snow-radar", "micasense-altum-pt"]
+    assert cfg["payload_sync"]["enabled"] and cfg["payload_sync"]["method"] == "gpio"
+    assert cfg["hud"]["survey_agl_ft"] == 2250
+    assert not any(q.startswith("Laser range check") for q in ui.asked)
+
+
+def test_short_range_laser_at_survey_height_warns():
+    ui = ScriptedUI({"Laser altimeter:": "benewake-tf03-180"})
+    configure.interview(ui, BASE)
+    warn = [q for q in ui.asked if q.startswith("Laser range check")]
+    assert warn and "read nothing" in warn[0]
+
+
+def test_range_warning_levels():
+    tf03 = {"name": "TF03", "max_range_m": 180}
+    assert configure.range_warning(tf03, 400) is None
+    assert "close to its limit" in configure.range_warning(tf03, 500)
+    assert "read nothing" in configure.range_warning(tf03, 2250)
+    assert configure.range_warning({"name": "g", "max_range_m": 0}, 9000) is None
+
+
+def test_apply_device_keeps_port_and_offset_drops_old_driver_fields():
+    old = {"port": "/dev/ttyUSB3", "mounting_offset_m": 0.7, "driver": "ascii_number", "poll": "d\r\n"}
+    dev = {"id": "x", "name": "X", "driver": "benewake", "baud": 115200, "driver_options": {"invalid_cm": [18000]}}
+    out = configure.apply_device(old, dev)
+    assert out["port"] == "/dev/ttyUSB3" and out["mounting_offset_m"] == 0.7
+    assert out["driver"] == "benewake" and "poll" not in out
+
+
+def test_needs_extras():
+    cat = configure.load_catalog()
+    prof = configure.by_id(cat["profiles"])["flight-controller"]
+    cfg = configure.build_config(BASE, {**configure.profile_answers(prof, BASE, cat), "buddy.model": "qwen3.5:2b"}, cat)
+    assert configure.needs_extras(cfg) == ["pymavlink", "ollama:qwen3.5:2b"]
+
+
+def test_every_profile_builds_a_config_the_daemon_accepts(tmp_path):
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "daemon"))
+    import drivers
+    import main
+    cat = configure.load_catalog()
+    for prof in cat["profiles"]:
+        for mode in ("live", "sim"):
+            cfg = configure.build_config(BASE, configure.profile_answers(prof, BASE, cat, mode), cat)
+            cfg["logging"]["fallback_dir"] = str(tmp_path / prof["id"])
+            for sec in ("gnss", "laser_altimeter", "imu_ahrs"):
+                c = cfg[sec]
+                if main.section_enabled(cfg, sec):
+                    assert c["driver"] in drivers.DRIVERS, (prof["id"], sec)
+            d = main.AeroLabDaemon(cfg, sim_mode=mode == "sim")
+            assert d.buddy.configured["imu"], prof["id"]      # attitude always has a source
 
 
 def test_written_config_loads_in_daemon(tmp_path):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "daemon"))
     import main
-    cfg = configure.build_config(BASE, {"mode": "sim"})
+    cfg = configure.build_config(BASE, {"mode": "sim"})  # no device answers: base sections kept
     cfg["logging"]["fallback_dir"] = str(tmp_path)
     out = tmp_path / "local.yaml"
     configure.write_config(cfg, out)

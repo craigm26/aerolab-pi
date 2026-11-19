@@ -1,6 +1,11 @@
-# AeroLab-Pi hardware and flight configuration
+# AeroLab-Pi hardware and flight configuration: the defaults.
+#
+# ./configure.sh writes your own copy to config/sensors.local.yaml (git-ignored)
+# from the profiles and device presets in config/hardware.yaml. Edit that copy,
+# not this file. Any device can also be set by hand: give a section a `driver`
+# (see daemon/drivers.py) plus port and baud.
 
-mode: "live"                # "live" or "sim"; ./configure.sh sets this
+mode: "live"                # "live" or "sim"
 
 server:
   host: "0.0.0.0"
@@ -8,24 +13,34 @@ server:
   hud_hz: 10
 
 gnss:
+  name: "GNSS"
+  driver: nmea              # NMEA GGA from any receiver
   port: "/dev/serial0"      # Pi GPIO UART (pins 8/10), or a USB GNSS such as /dev/ttyACM0
   baud: 9600
 
 laser_altimeter:
+  name: "Laser altimeter"
+  driver: ascii_number      # first number on each line is the range
   port: "/dev/ttyUSB0"
   baud: 115200
   mounting_offset_m: 0.4    # vertical distance from the laser to the wheels/belly
-  unit: "m"                 # "m" or "cm", whatever the sensor prints
+  unit: "m"                 # "m", "cm" or "mm", whatever the sensor prints
+  max_range_m: 0            # readings beyond this (x1.05) are ignored; 0 = no limit
 
 imu_ahrs:
+  name: "Attitude sensor"
+  driver: csv_rpy           # "roll,pitch,yaw" degrees per line
   port: "/dev/ttyUSB1"
-  baud: 115200              # expects CSV lines: roll_deg,pitch_deg,yaw_deg
+  baud: 115200
 
 payload_sync:
   enabled: true
-  gpio_pin: 17              # BCM pin for the hardware trigger (snow radar / multispectral camera)
+  method: gpio              # "gpio" pulse, or "http" (GET http_url per capture)
+  gpio_pin: 17              # BCM pin for the hardware trigger
+  active_high: true
   trigger_hz: 1.0           # pulses per second
   pulse_width_ms: 20
+  http_url: ""
 
 logging:
   primary_dir: "/mnt/ssd/aerolab_logs"   # used only when /mnt/ssd is a mounted drive
@@ -35,3 +50,14 @@ logging:
 
 hud:
   low_agl_warn_ft: 200      # AGL readout turns amber below this
+  survey_agl_ft: 0          # planned survey height; setup warns if the laser can't reach it
+
+buddy:
+  ai: false                 # true = answer open questions with a local Ollama model
+  ollama_url: "http://127.0.0.1:11434"
+  model: "qwen3.5:2b"
+  keep_alive: "60m"         # keep the model loaded so answers start fast
+  timeout_s: 120
+
+sim:
+  faults: false             # true = the simulated laser drops out 4 s in every 45 s

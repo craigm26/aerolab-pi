@@ -2,16 +2,18 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black" />
+  <meta name="theme-color" content="#000000" />
   <title>AeroLab HUD</title>
   <!-- No external dependencies: works fully offline on the cockpit Wi-Fi. -->
   <style>
     :root {
       --bg: #000000;
       --panel: #111418;
+      --panel-2: #090b0e;
       --border: #262c36;
       --text: #f0f4f8;
       --muted: #8b949e;
@@ -19,10 +21,14 @@
       --warn: #ffb300;
       --err: #ff3d00;
       --accent: #00e5ff;
+      --sky: #0d2238;
+      --earth: #4a3520;
     }
-    * { box-sizing: border-box; margin: 0; padding: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
     html, body { background: var(--bg); }
-    body { color: var(--text); height: 100vh; height: 100dvh; display: flex; flex-direction: column; padding: 12px; gap: 12px; overflow: hidden; }
+    body { color: var(--text); height: 100vh; height: 100dvh; display: flex; flex-direction: column; padding: 12px; gap: 12px; overflow: hidden;
+           padding-left: max(12px, env(safe-area-inset-left)); padding-right: max(12px, env(safe-area-inset-right)); }
+    button { font: inherit; color: inherit; cursor: pointer; }
 
     #banner { display: none; background: var(--err); color: #fff; text-align: center; font-weight: 800; padding: 8px; border-radius: 6px; letter-spacing: 1px; }
     #banner.show { display: block; }
@@ -34,6 +40,10 @@
     .pill.ok { border-color: var(--ok); color: var(--ok); }
     .pill.err { border-color: var(--err); color: var(--err); }
     .pill.warn { border-color: var(--warn); color: var(--warn); }
+    .pill.off { border-color: var(--border); color: var(--muted); }
+    #p-buddy { border-color: var(--accent); color: var(--accent); position: relative; }
+    #p-buddy .badge { display: none; position: absolute; top: -8px; right: -6px; background: var(--err); color: #fff; border-radius: 10px; font-size: 0.7rem; padding: 1px 6px; }
+    #p-buddy .badge.show { display: inline-block; }
 
     .main-grid { flex: 1; display: grid; grid-template-columns: 2fr 1fr; gap: 12px; min-height: 0; }
     @media (max-width: 700px) {
@@ -49,19 +59,135 @@
     .agl-low { color: var(--warn) !important; }
     .agl-stale { color: var(--err) !important; }
 
-    .horizon-box { width: 160px; height: 160px; border-radius: 50%; border: 3px solid var(--border); position: relative; overflow: hidden; background: #0d2238; margin-bottom: 12px; }
-    .ground { position: absolute; left: -50%; width: 200%; height: 150%; top: 50%; background: #4a3520; border-top: 2px solid #fff; transform-origin: 50% 0%; }
+    .horizon-box { width: 160px; height: 160px; border-radius: 50%; border: 3px solid var(--border); position: relative; overflow: hidden; background: var(--sky); margin-bottom: 12px; }
+    .ground { position: absolute; left: -50%; width: 200%; height: 150%; top: 50%; background: var(--earth); border-top: 2px solid #fff; transform-origin: 50% 0%; }
     .wings { position: absolute; top: 50%; left: 50%; width: 70px; height: 4px; background: var(--warn); transform: translate(-50%, -50%); z-index: 2; }
 
     .metrics { width: 100%; display: grid; grid-template-columns: 1fr 1fr; gap: 8px; font-size: 0.9rem; }
-    .metric { background: #090b0e; padding: 8px; border-radius: 6px; border: 1px solid var(--border); }
+    .metric { background: var(--panel-2); padding: 8px; border-radius: 6px; border: 1px solid var(--border); }
     .metric span { display: block; color: var(--muted); font-size: 0.7rem; }
     .metric strong { font-size: 1rem; }
 
     .footer { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 4px 12px; font-size: 0.8rem; color: var(--muted); padding: 0 4px; }
+
+    /* ---- callout toasts ---- */
+    #toasts { position: fixed; left: 50%; bottom: max(44px, calc(env(safe-area-inset-bottom) + 36px)); transform: translateX(-50%); display: flex; flex-direction: column; gap: 8px; z-index: 40; width: min(560px, calc(100% - 24px)); pointer-events: none; }
+    .toast { background: var(--panel); border: 2px solid var(--border); border-left-width: 8px; border-radius: 8px; padding: 10px 14px; font-weight: 800; letter-spacing: 0.5px;
+             animation: toast-in 220ms ease-out, toast-out 400ms ease-in 5.6s forwards; box-shadow: 0 8px 30px rgba(0,0,0,0.6); }
+    .toast.alert { border-color: var(--err); color: #fff; background: #2a0d05; }
+    .toast.warn { border-color: var(--warn); color: var(--warn); }
+    .toast.info { border-color: var(--ok); color: var(--ok); }
+    @keyframes toast-in { from { opacity: 0; transform: translateY(-12px); } to { opacity: 1; transform: none; } }
+    @keyframes toast-out { to { opacity: 0; transform: translateY(-8px); } }
+
+    /* ---- buddy panel ---- */
+    #buddy { position: fixed; top: 0; right: 0; bottom: 0; width: min(440px, 100%); background: #0b0e12; border-left: 1px solid var(--border); z-index: 50;
+             transform: translateX(105%); transition: transform 220ms ease-out; display: flex; flex-direction: column; padding: 14px; gap: 10px;
+             padding-right: max(14px, env(safe-area-inset-right)); }
+    #buddy.open { transform: none; box-shadow: -20px 0 50px rgba(0,0,0,0.7); }
+    .b-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+    .b-title { color: var(--accent); font-weight: 900; letter-spacing: 3px; }
+    .b-sub { color: var(--muted); font-size: 0.75rem; }
+    .b-close { background: none; border: 1px solid var(--border); border-radius: 6px; padding: 6px 10px; }
+    .tabs { display: flex; gap: 6px; }
+    .tab { flex: 1; background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 8px 4px; font-size: 0.8rem; font-weight: 700; color: var(--muted); }
+    .tab.on { color: var(--accent); border-color: var(--accent); }
+    .pane { display: none; flex: 1; min-height: 0; overflow-y: auto; flex-direction: column; gap: 8px; }
+    .pane.on { display: flex; }
+    .ev { display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; padding: 8px; border-radius: 6px; background: var(--panel); border-left: 4px solid var(--border); font-size: 0.85rem; }
+    .ev time { color: var(--muted); font-size: 0.75rem; }
+    .ev.alert { border-left-color: var(--err); } .ev.warn { border-left-color: var(--warn); } .ev.info { border-left-color: var(--ok); }
+    .row { display: flex; gap: 8px; align-items: center; }
+    .toggle { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; font-size: 0.8rem; font-weight: 700; }
+    .toggle.on { border-color: var(--ok); color: var(--ok); }
+    .chk { display: grid; grid-template-columns: 54px 1fr; gap: 2px 10px; padding: 8px; background: var(--panel); border-radius: 6px; font-size: 0.85rem; }
+    .chk b { font-size: 0.75rem; letter-spacing: 1px; }
+    .chk .d { grid-column: 2; color: var(--muted); font-size: 0.8rem; }
+    .chk.ok b { color: var(--ok); } .chk.warn b { color: var(--warn); } .chk.fail b { color: var(--err); }
+    .msgs { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; }
+    .msg { padding: 8px 10px; border-radius: 8px; font-size: 0.9rem; line-height: 1.35; max-width: 92%; white-space: pre-wrap; }
+    .msg.me { align-self: flex-end; background: #0f2a33; border: 1px solid #12505e; }
+    .msg.bud { align-self: flex-start; background: var(--panel); border: 1px solid var(--border); }
+    .msg.bud.thinking { color: var(--muted); }
+    .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+    .chip { background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 5px 10px; font-size: 0.75rem; color: var(--muted); }
+    .ask { display: flex; gap: 6px; }
+    .ask input { flex: 1; min-width: 0; background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 10px; font: inherit; font-size: 16px; }
+    .ask button { background: var(--accent); color: #000; border: none; border-radius: 6px; padding: 0 14px; font-weight: 900; }
+    .note { color: var(--muted); font-size: 0.72rem; line-height: 1.4; }
+
+    /* ---- boot sequence ---- */
+    #boot { position: fixed; inset: 0; z-index: 100; background: radial-gradient(ellipse at 50% 40%, #07141f 0%, #000 70%); display: flex; flex-direction: column;
+            align-items: center; justify-content: center; gap: 18px; padding: 24px; transition: opacity 500ms ease, transform 600ms cubic-bezier(.2,.8,.2,1); }
+    #boot.gone { opacity: 0; transform: scale(1.04); pointer-events: none; }
+    #boot svg { width: min(46vmin, 260px); height: auto; overflow: visible; }
+    .ring { fill: none; stroke: var(--accent); stroke-width: 2; stroke-dasharray: 600; stroke-dashoffset: 600; animation: draw 900ms ease-out forwards; }
+    .ring2 { fill: none; stroke: #12313f; stroke-width: 1; }
+    .tick { stroke: var(--accent); stroke-width: 2; opacity: 0; animation: fade 300ms ease-out forwards; }
+    #boot-sky { animation: settle 1300ms cubic-bezier(.3,1.4,.4,1) 300ms both; transform-origin: 100px 100px; }
+    .plane { fill: none; stroke: var(--warn); stroke-width: 4; stroke-linecap: round; opacity: 0; animation: fade 300ms ease-out 900ms forwards; }
+    .sweep { fill: url(#sweepGrad); transform-origin: 100px 100px; animation: spin 1800ms linear 200ms 2 both; opacity: 0.55; }
+    @keyframes draw { to { stroke-dashoffset: 0; } }
+    @keyframes fade { to { opacity: 1; } }
+    @keyframes settle { from { transform: rotate(-38deg) translateY(30px); } to { transform: rotate(0) translateY(0); } }
+    @keyframes spin { from { transform: rotate(0); opacity: 0.55; } 95% { opacity: 0.55; } to { transform: rotate(360deg); opacity: 0; } }
+    .wordmark { font-size: clamp(1.6rem, 6vw, 2.6rem); font-weight: 900; letter-spacing: 0.35em; color: #fff; text-indent: 0.35em; }
+    .wordmark span { display: inline-block; opacity: 0; transform: translateY(8px); animation: letter 380ms ease-out forwards; }
+    .wordmark .dash { color: var(--accent); }
+    @keyframes letter { to { opacity: 1; transform: none; } }
+    .tagline { color: var(--muted); font-size: 0.8rem; letter-spacing: 0.3em; opacity: 0; animation: fade 500ms ease-out 1100ms forwards; text-align: center; }
+    .selftest { width: min(440px, 100%); display: flex; flex-direction: column; gap: 5px; font-size: 0.9rem; min-height: 190px; }
+    .st { display: flex; gap: 8px; opacity: 0; transform: translateX(-6px); transition: opacity 200ms, transform 200ms; }
+    .st.in { opacity: 1; transform: none; }
+    .st .k { color: #c9d1d9; letter-spacing: 1px; }
+    .st .dots { flex: 1; overflow: hidden; color: #2b3440; white-space: nowrap; }
+    .st .dots::before { content: "................................................................"; }
+    .st .v { font-weight: 800; color: var(--muted); }
+    .st .v.ok { color: var(--ok); } .st .v.warn { color: var(--warn); } .st .v.err { color: var(--err); } .st .v.off { color: #55606c; }
+    .ready { font-weight: 900; letter-spacing: 0.6em; text-indent: 0.6em; color: var(--ok); opacity: 0; height: 1.4em; }
+    .ready.in { animation: stamp 420ms cubic-bezier(.2,1.6,.4,1) forwards; }
+    @keyframes stamp { from { opacity: 0; transform: scale(1.6); } to { opacity: 1; transform: none; } }
+    .skip { position: absolute; bottom: max(16px, env(safe-area-inset-bottom)); color: #3d4752; font-size: 0.72rem; letter-spacing: 2px; }
+    @media (prefers-reduced-motion: reduce) {
+      #boot *, #boot { animation-duration: 1ms !important; animation-delay: 0ms !important; transition-duration: 1ms !important; }
+    }
   </style>
 </head>
 <body>
+  <!-- ======== boot sequence ======== -->
+  <div id="boot" role="status" aria-live="polite">
+    <svg viewBox="0 0 200 200" aria-hidden="true">
+      <defs>
+        <clipPath id="ballClip"><circle cx="100" cy="100" r="78" /></clipPath>
+        <linearGradient id="sweepGrad" x1="0" y1="0" x2="1" y2="0">
+          <stop offset="0" stop-color="#00e5ff" stop-opacity="0" />
+          <stop offset="1" stop-color="#00e5ff" stop-opacity="0.5" />
+        </linearGradient>
+      </defs>
+      <g clip-path="url(#ballClip)">
+        <g id="boot-sky">
+          <rect x="-60" y="-60" width="320" height="160" fill="#0d2238" />
+          <rect x="-60" y="100" width="320" height="160" fill="#4a3520" />
+          <line x1="-60" y1="100" x2="260" y2="100" stroke="#fff" stroke-width="2" />
+          <g stroke="#8fb3c9" stroke-width="1.5" opacity="0.8">
+            <line x1="85" y1="80" x2="115" y2="80" /><line x1="90" y1="90" x2="110" y2="90" />
+            <line x1="85" y1="120" x2="115" y2="120" /><line x1="90" y1="110" x2="110" y2="110" />
+          </g>
+        </g>
+        <path class="sweep" d="M100 100 L178 100 A78 78 0 0 0 167 60 Z" />
+      </g>
+      <circle class="ring2" cx="100" cy="100" r="90" />
+      <circle class="ring" cx="100" cy="100" r="80" />
+      <g id="ticks"></g>
+      <path class="plane" d="M58 100 H88 L100 110 L112 100 H142" />
+    </svg>
+    <div class="wordmark" id="wordmark" aria-label="AeroLab-Pi"></div>
+    <div class="tagline" id="tagline">AIRBORNE SCIENCE PAYLOAD</div>
+    <div class="selftest" id="selftest"></div>
+    <div class="ready" id="ready">READY</div>
+    <div class="skip">TAP TO SKIP</div>
+  </div>
+
   <div id="banner" class="show">CONNECTING TO AEROLAB-PI...</div>
   <div id="simtag">SIMULATED DATA, NOT A REAL FLIGHT</div>
 
@@ -71,7 +197,10 @@
     <div id="p-imu" class="pill err">IMU</div>
     <div id="p-log" class="pill err">LOG</div>
     <div id="p-sync" class="pill">TRIG: 0</div>
+    <button id="p-buddy" class="pill" aria-label="Open Buddy">BUDDY<span class="badge" id="badge">0</span></button>
   </div>
+
+  <div id="toasts" aria-live="assertive"></div>
 
   <div class="main-grid">
     <div class="card">
@@ -90,7 +219,7 @@
         <div class="metric"><span>ROLL</span><strong id="roll">0.0°</strong></div>
         <div class="metric"><span>PITCH</span><strong id="pitch">0.0°</strong></div>
         <div class="metric"><span>HDG</span><strong id="yaw">000°</strong></div>
-        <div class="metric"><span>MSL</span><strong id="msl">0 m</strong></div>
+        <div class="metric"><span id="msl-label">MSL</span><strong id="msl">0 m</strong></div>
       </div>
     </div>
   </div>
@@ -101,21 +230,303 @@
     <div id="utc">UTC: --:--:--</div>
   </div>
 
+  <!-- ======== buddy panel ======== -->
+  <aside id="buddy" aria-label="Buddy">
+    <div class="b-head">
+      <div>
+        <div class="b-title">BUDDY</div>
+        <div class="b-sub" id="b-ai">checking for a local AI model...</div>
+      </div>
+      <button class="b-close" id="b-close">CLOSE</button>
+    </div>
+    <div class="tabs">
+      <button class="tab on" data-pane="pane-callouts">CALLOUTS</button>
+      <button class="tab" data-pane="pane-check">GROUND CHECK</button>
+      <button class="tab" data-pane="pane-ask">ASK</button>
+    </div>
+
+    <div class="pane on" id="pane-callouts">
+      <div class="row">
+        <button class="toggle" id="voice">VOICE: OFF</button>
+        <span class="note">Speaks each callout using the device's built-in voice. Works offline.</span>
+      </div>
+      <div id="evlist" style="display:flex;flex-direction:column;gap:6px"></div>
+      <div class="note" id="ev-empty">No callouts yet. Buddy speaks up when a sensor drops out or comes back, the GNSS fix changes, you cross the low-AGL line, logging stops, or the Pi runs hot or short of power.</div>
+    </div>
+
+    <div class="pane" id="pane-check">
+      <button class="toggle" id="run-check">RUN GROUND CHECK</button>
+      <div class="note">Run on the ramp before engine start. Uses the live data: the laser should read about 0 m AGL on the ground, which confirms the mounting offset.</div>
+      <div id="checklist" style="display:flex;flex-direction:column;gap:6px"></div>
+    </div>
+
+    <div class="pane" id="pane-ask">
+      <div class="msgs" id="msgs"></div>
+      <div class="chips">
+        <button class="chip">Quick status</button>
+        <button class="chip">Flight summary</button>
+        <button class="chip">How many triggers so far?</button>
+        <button class="chip">Why did a sensor drop out?</button>
+      </div>
+      <form class="ask" id="askform">
+        <input id="q" autocomplete="off" placeholder="Ask about the instruments..." />
+        <button type="submit">ASK</button>
+      </form>
+      <div class="note">For crew and ground use. Buddy answers from this Pi's own data, offline. It reports instrument status only, never flight advice.</div>
+    </div>
+  </aside>
+
   <script>
     const $ = (id) => document.getElementById(id);
+    const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+    const store = { get(k, d) { try { return localStorage.getItem(k) ?? d; } catch { return d; } },
+                    set(k, v) { try { localStorage.setItem(k, v); } catch {} } };
+
+    let last = null;          // latest state from the daemon
+    let lastMsg = 0;
+    let seenEvent = 0;        // highest callout id already shown
+    let unread = 0;
+
+    /* ------------------------------------------------------------ boot */
+    const boot = {
+      started: performance.now(),
+      done: false,
+      rows: [
+        ["LINK", "link"], ["GNSS", "gnss"], ["LASER", "laser"], ["ATTITUDE", "imu"],
+        ["LOGGER", "log"], ["TRIGGER", "trig"], ["BUDDY", "buddy"],
+      ],
+      init() {
+        const word = "AEROLAB-PI";
+        $("wordmark").innerHTML = [...word].map((c, i) =>
+          `<span class="${c === "-" ? "dash" : ""}" style="animation-delay:${450 + i * 55}ms">${c}</span>`).join("");
+        let t = "";
+        for (let i = 0; i < 36; i++) {
+          const a = (i * 10) * Math.PI / 180, long = i % 3 === 0;
+          const r1 = long ? 82 : 85, r2 = 90;
+          t += `<line class="tick" style="animation-delay:${300 + i * 14}ms" x1="${100 + r1 * Math.cos(a)}" y1="${100 + r1 * Math.sin(a)}" x2="${100 + r2 * Math.cos(a)}" y2="${100 + r2 * Math.sin(a)}"/>`;
+        }
+        $("ticks").innerHTML = t;
+        $("selftest").innerHTML = this.rows.map(([label, key]) =>
+          `<div class="st" id="st-${key}"><span class="k">${label}</span><span class="dots"></span><span class="v">CHECKING</span></div>`).join("");
+        this.rows.forEach(([, key], i) => setTimeout(() => $("st-" + key).classList.add("in"), 1250 + i * 110));
+        $("boot").addEventListener("click", () => this.finish(true));
+        setTimeout(() => this.finish(false), 7000);   // never hold the display hostage
+        this.spin();
+      },
+      spin() {
+        const frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
+        let i = 0;
+        this.spinner = setInterval(() => {
+          i++;
+          document.querySelectorAll("#selftest .v.pending, #selftest .v:not(.ok):not(.warn):not(.err):not(.off)")
+            .forEach((el) => { if (el.textContent === "CHECKING" || el.dataset.spin) { el.dataset.spin = 1; el.textContent = frames[i % frames.length] + " CHECKING"; } });
+        }, 80);
+      },
+      set(key, cls, text) {
+        const v = document.querySelector(`#st-${key} .v`);
+        if (!v || v.dataset.final) return;
+        v.dataset.final = 1; delete v.dataset.spin;
+        v.className = "v " + cls; v.textContent = text;
+      },
+      update(d) {
+        if (this.done) return;
+        const since = performance.now() - this.started;
+        const delay = Math.max(0, 1500 - since);
+        setTimeout(() => this.resolve(d), delay);
+      },
+      resolve(d) {
+        if (this.done) return;
+        const cfgd = d._configured || {};
+        if (d.sim_mode) { $("tagline").textContent = "AIRBORNE SCIENCE PAYLOAD · SIMULATION"; $("tagline").style.color = "var(--warn)"; }
+        const step = (i, fn) => setTimeout(fn, i * 170);
+        step(0, () => this.set("link", "ok", "OK"));
+        step(1, () => !cfgd.gnss ? this.set("gnss", "off", "NOT FITTED")
+          : d.gnss_ok ? this.set("gnss", d.gps_fix > 0 ? "ok" : "warn", (d.gps_fix > 0 ? "FIX" : "NO FIX") + (d.sats >= 0 ? ` · ${d.sats} SATS` : ""))
+          : this.waitOr("gnss", "err", "NO DATA"));
+        step(2, () => !cfgd.laser ? this.set("laser", "off", "NOT FITTED")
+          : d.laser_ok ? this.set("laser", "ok", `${d.laser_raw_m.toFixed(1)} M`) : this.waitOr("laser", "err", "NO DATA"));
+        step(3, () => !cfgd.imu ? this.set("imu", "off", "NOT FITTED")
+          : d.imu_ok ? this.set("imu", "ok", `ROLL ${d.roll_deg.toFixed(0)}° PITCH ${d.pitch_deg.toFixed(0)}°`) : this.waitOr("imu", "err", "NO DATA"));
+        step(4, () => d.logging_active
+          ? this.set("log", d.sim_mode ? "warn" : (/\/mnt\/|\/media\//.test(d.log_dir) ? "ok" : "warn"),
+                     d.sim_mode ? "SIM LOGS" : (/\/mnt\/|\/media\//.test(d.log_dir) ? "SSD" : "SD CARD"))
+          : this.waitOr("log", "err", "NOT WRITING"));
+        step(5, () => d.trigger_count > 0 ? this.set("trig", d.gpio_live ? "ok" : "warn", d.gpio_live ? "PULSING" : "NO GPIO")
+          : this.set("trig", "off", "OFF"));
+        step(6, () => {
+          const ai = d._ai || {};
+          this.set("buddy", "ok", ai.available ? `AI · ${String(ai.model).toUpperCase()}` : "CALLOUTS ON");
+        });
+        step(7.5, () => this.finishSoon());
+      },
+      waitOr(key, cls, text) {
+        // Give a slow sensor a moment before calling it missing.
+        setTimeout(() => { if (last) {
+          const okNow = { gnss: last.gnss_ok, laser: last.laser_ok, imu: last.imu_ok, log: last.logging_active }[key];
+          if (okNow) this.resolve(last); else this.set(key, cls, text);
+        } else this.set(key, cls, text); }, 1200);
+      },
+      finishSoon() {
+        setTimeout(() => {
+          document.querySelectorAll("#selftest .v:not([data-final])").forEach((v) => {
+            v.dataset.final = 1; v.className = "v err"; v.textContent = "NO DATA"; });
+          const anyErr = document.querySelector("#selftest .v.err");
+          const r = $("ready");
+          r.textContent = anyErr ? "CHECK SENSORS" : "READY";
+          r.style.color = anyErr ? "var(--warn)" : "var(--ok)";
+          r.classList.add("in");
+          setTimeout(() => this.finish(false), 900);
+        }, 1400);
+      },
+      finish(skipped) {
+        if (this.done) return;
+        this.done = true;
+        clearInterval(this.spinner);
+        if (!last) $("selftest").querySelectorAll(".v:not([data-final])").forEach((v) => { v.className = "v err"; v.textContent = "NO LINK"; });
+        $("boot").classList.add("gone");
+        setTimeout(() => $("boot").remove(), 700);
+      },
+    };
+    boot.init();
+
+    /* ------------------------------------------------------------ HUD */
     const setPill = (id, state, text) => {
       const el = $(id);
       el.className = "pill " + state;
       if (text) el.textContent = text;
     };
 
-    let lastMsg = 0;
+    function render(d) {
+      $("simtag").classList.toggle("show", !!d.sim_mode);
+      const agl = $("agl-ft");
+      agl.textContent = d.laser_ok ? Math.round(d.agl_ft) : "---";
+      agl.classList.toggle("agl-low", d.laser_ok && d.agl_ft < d.low_agl_warn_ft);
+      agl.classList.toggle("agl-stale", !d.laser_ok);
 
+      $("agl-m").textContent = d.agl_m.toFixed(1);
+      $("raw-m").textContent = d.laser_raw_m.toFixed(1);
+      $("roll").textContent = `${d.roll_deg.toFixed(1)}°`;
+      $("pitch").textContent = `${d.pitch_deg.toFixed(1)}°`;
+      $("yaw").textContent = `${String(Math.round(d.yaw_deg) % 360).padStart(3, "0")}°`;
+      $("msl").textContent = `${Math.round(d.alt_msl_m)} m`;
+      $("msl-label").textContent = d.alt_ref || "MSL";
+
+      // Artificial horizon: ground moves down when nose pitches up.
+      const pitchPx = Math.max(-45, Math.min(45, d.pitch_deg * 2));
+      $("ground").style.transform = `translateY(${pitchPx}px) rotate(${-d.roll_deg}deg)`;
+
+      const c = d._configured || { gnss: true, laser: true, imu: true };
+      if (c.gnss) setPill("p-gnss", d.gnss_ok && d.gps_fix > 0 ? "ok" : (d.gnss_ok ? "warn" : "err"),
+                          d.gnss_ok && d.gps_fix === 0 ? `NO FIX${d.sats >= 0 ? ` (${d.sats})` : ""}` : `GNSS (${d.sats >= 0 ? d.sats : "INS"})`);
+      else setPill("p-gnss", "off", "GNSS —");
+      if (c.laser) setPill("p-laser", d.laser_ok ? "ok" : "err", "LASER"); else setPill("p-laser", "off", "LASER —");
+      if (c.imu) setPill("p-imu", d.imu_ok ? "ok" : "err", "IMU"); else setPill("p-imu", "off", "IMU —");
+      setPill("p-log", d.logging_active ? "ok" : "err", d.sim_mode ? "LOG (SIM)" : (d.logging_active ? "LOGGING" : "NOT LOGGING"));
+      setPill("p-sync", d.trigger_count === 0 ? "off" : (d.gpio_live ? "ok" : "warn"),
+              `TRIG: ${d.trigger_count}${d.gpio_live || d.trigger_count === 0 ? "" : " (NO GPIO)"}`);
+
+      $("coords").textContent = `LAT: ${d.lat.toFixed(5)} | LON: ${d.lon.toFixed(5)}`;
+      $("logfile").textContent = `LOG: ${d.log_file || "---"}`;
+      $("utc").textContent = `UTC: ${d.utc_iso ? d.utc_iso.slice(11, 19) : "--:--:--"}`;
+
+      const ai = d._ai || {};
+      $("b-ai").textContent = ai.available ? `Local AI: ${ai.model}` : `Rules only (${ai.reason || "no AI model"})`;
+      handleEvents(d._events || []);
+    }
+
+    /* ------------------------------------------------------------ callouts */
+    let voiceOn = store.get("aerolab.voice", "0") === "1";
+    const updateVoiceBtn = () => { $("voice").textContent = voiceOn ? "VOICE: ON" : "VOICE: OFF"; $("voice").classList.toggle("on", voiceOn); };
+    updateVoiceBtn();
+    $("voice").onclick = () => {
+      voiceOn = !voiceOn; store.set("aerolab.voice", voiceOn ? "1" : "0"); updateVoiceBtn();
+      if (voiceOn) speak("Voice callouts on");   // also unlocks audio on iOS (needs a tap)
+    };
+    function speak(text) {
+      if (!voiceOn || !("speechSynthesis" in window)) return;
+      const u = new SpeechSynthesisUtterance(text);
+      u.rate = 1.05;
+      speechSynthesis.speak(u);
+    }
+    const fmtTime = (ts) => new Date(ts * 1000).toISOString().slice(11, 19) + "Z";
+
+    function handleEvents(events) {
+      const fresh = events.filter((e) => e.id > seenEvent);
+      if (!fresh.length) return;
+      const firstLoad = seenEvent === 0;
+      seenEvent = Math.max(...events.map((e) => e.id));
+      $("ev-empty").style.display = "none";
+      const list = $("evlist");
+      for (const e of fresh) {
+        list.insertAdjacentHTML("afterbegin",
+          `<div class="ev ${e.level}"><time>${fmtTime(e.ts)}</time><span>${esc(e.text)}</span></div>`);
+      }
+      if (firstLoad) return;   // don't replay old callouts as toasts after a reconnect
+      for (const e of fresh.slice(-3)) {
+        const t = document.createElement("div");
+        t.className = "toast " + e.level;
+        t.textContent = e.text;
+        $("toasts").appendChild(t);
+        setTimeout(() => t.remove(), 6200);
+        if (e.level !== "info") speak(e.text);
+      }
+      if (!$("buddy").classList.contains("open")) {
+        unread += fresh.filter((e) => e.level !== "info").length;
+        $("badge").textContent = unread; $("badge").classList.toggle("show", unread > 0);
+      }
+    }
+
+    /* ------------------------------------------------------------ buddy panel */
+    $("p-buddy").onclick = () => { $("buddy").classList.add("open"); unread = 0; $("badge").classList.remove("show"); };
+    $("b-close").onclick = () => $("buddy").classList.remove("open");
+    document.querySelectorAll(".tab").forEach((tab) => tab.onclick = () => {
+      document.querySelectorAll(".tab").forEach((t) => t.classList.toggle("on", t === tab));
+      document.querySelectorAll(".pane").forEach((p) => p.classList.toggle("on", p.id === tab.dataset.pane));
+      if (tab.dataset.pane === "pane-check") runCheck();
+    });
+
+    async function runCheck() {
+      const box = $("checklist");
+      box.innerHTML = `<div class="note">Checking...</div>`;
+      try {
+        const items = await (await fetch("/api/buddy/check")).json();
+        box.innerHTML = items.map((i) =>
+          `<div class="chk ${i.status}"><b>${i.status === "fail" ? "FAIL" : i.status.toUpperCase()}</b><span>${esc(i.item)}</span><span class="d">${esc(i.detail)}</span></div>`).join("");
+      } catch { box.innerHTML = `<div class="note">Could not reach the Pi.</div>`; }
+    }
+    $("run-check").onclick = runCheck;
+
+    async function ask(question) {
+      const msgs = $("msgs");
+      msgs.insertAdjacentHTML("beforeend", `<div class="msg me">${esc(question)}</div>`);
+      const out = document.createElement("div");
+      out.className = "msg bud thinking";
+      out.textContent = (last && last._ai && last._ai.available) ? "Thinking (local AI on the Pi, can take a while)..." : "...";
+      msgs.appendChild(out);
+      msgs.scrollTop = msgs.scrollHeight;
+      try {
+        const r = await fetch("/api/buddy/ask", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ question }) });
+        const reader = r.body.getReader();
+        const dec = new TextDecoder();
+        let text = "";
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          text += dec.decode(value, { stream: true });
+          out.classList.remove("thinking");
+          out.textContent = text;
+          msgs.scrollTop = msgs.scrollHeight;
+        }
+      } catch { out.textContent = "Could not reach the Pi."; }
+    }
+    $("askform").onsubmit = (e) => { e.preventDefault(); const q = $("q").value.trim(); if (q) { $("q").value = ""; ask(q); } };
+    document.querySelectorAll(".chip").forEach((c) => c.onclick = () => ask(c.textContent));
+
+    /* ------------------------------------------------------------ link */
     function connect() {
       const proto = location.protocol === "https:" ? "wss" : "ws";
       const ws = new WebSocket(`${proto}://${location.host}/ws`);
       const banner = $("banner");
-
       ws.onopen = () => banner.classList.remove("show");
       ws.onclose = () => {
         banner.textContent = "LINK LOST, RECONNECTING...";
@@ -123,41 +534,14 @@
         setTimeout(connect, 1000);
       };
       ws.onerror = () => ws.close();
-
       ws.onmessage = (evt) => {
         lastMsg = Date.now();
         banner.classList.remove("show");
         const d = JSON.parse(evt.data);
-
-        $("simtag").classList.toggle("show", !!d.sim_mode);
-
-        const agl = $("agl-ft");
-        agl.textContent = d.laser_ok ? Math.round(d.agl_ft) : "---";
-        agl.classList.toggle("agl-low", d.laser_ok && d.agl_ft < d.low_agl_warn_ft);
-        agl.classList.toggle("agl-stale", !d.laser_ok);
-
-        $("agl-m").textContent = d.agl_m.toFixed(1);
-        $("raw-m").textContent = d.laser_raw_m.toFixed(1);
-
-        $("roll").textContent = `${d.roll_deg.toFixed(1)}°`;
-        $("pitch").textContent = `${d.pitch_deg.toFixed(1)}°`;
-        $("yaw").textContent = `${String(Math.round(d.yaw_deg) % 360).padStart(3, "0")}°`;
-        $("msl").textContent = `${Math.round(d.alt_msl_m)} m`;
-
-        // Artificial horizon: ground moves down when nose pitches up.
-        const pitchPx = Math.max(-45, Math.min(45, d.pitch_deg * 2));
-        $("ground").style.transform = `translateY(${pitchPx}px) rotate(${-d.roll_deg}deg)`;
-
-        setPill("p-gnss", d.gnss_ok && d.gps_fix > 0 ? "ok" : (d.gnss_ok ? "warn" : "err"),
-                d.gnss_ok && d.gps_fix === 0 ? `NO FIX (${d.sats})` : `GNSS (${d.sats})`);
-        setPill("p-laser", d.laser_ok ? "ok" : "err", "LASER");
-        setPill("p-imu", d.imu_ok ? "ok" : "err", "IMU");
-        setPill("p-log", d.logging_active ? "ok" : "err", d.sim_mode ? "LOG (SIM)" : (d.logging_active ? "LOGGING" : "NOT LOGGING"));
-        setPill("p-sync", d.gpio_live ? "ok" : "warn", `TRIG: ${d.trigger_count}${d.gpio_live ? "" : " (NO GPIO)"}`);
-
-        $("coords").textContent = `LAT: ${d.lat.toFixed(5)} | LON: ${d.lon.toFixed(5)}`;
-        $("logfile").textContent = `LOG: ${d.log_file || "---"}`;
-        $("utc").textContent = `UTC: ${d.utc_iso ? d.utc_iso.slice(11, 19) : "--:--:--"}`;
+        const first = !last;
+        last = d;
+        render(d);
+        if (first) boot.update(d);
       };
     }
 

@@ -1,0 +1,435 @@
+# AeroLab-Pi hardware catalog.
+#
+# Each device is a preset: the driver that reads it and its factory serial
+# settings. ./configure.sh offers these in menus, and the profiles at the
+# bottom bundle them into whole-aircraft setups.
+#
+# confidence:
+#   manual     - protocol and defaults taken from the vendor manual/datasheet
+#   secondary  - from well-used open-source drivers (ArduPilot/PX4) or distributor docs
+#   unverified - format not confirmed; the driver is a best effort, check on the bench
+#
+# Nothing here has been flown with AeroLab-Pi yet. Check every sensor on the
+# bench (./configure.sh, then the Buddy ground check) before it goes on an aircraft.
+#
+# Levels: Pi GPIO/UART is 3.3 V. RS-232 and RS-422 devices need a USB adapter
+# (e.g. FTDI-based USB-RS232/RS422), never a direct wire to the Pi's pins.
+
+lasers:
+  - id: riegl-ld90-3800
+    name: Riegl LD90-3800 (HiP-LR)
+    driver: riegl_ld90
+    baud: 4800
+    interface: RS-232 (RS-422 selectable); USB-RS232 adapter
+    max_range_m: 2500
+    confidence: unverified
+    notes: >-
+      Classic airborne laser altimeter and the only unit in this catalog rated
+      past 600 m (2500 m max on a good target; natural-surface range not
+      confirmed). Powers up measuring; 4800 8N1 factory. Output is ASCII blocks
+      (r = range, m = status). Discontinued; bought used.
+    source: https://www.manualslib.com/manual/2527782/Riegl-Ld90-3.html
+
+  - id: jenoptik-ldm301
+    name: Jenoptik / ASTECH LDM301
+    driver: ascii_number
+    baud: 9600
+    interface: RS-232 or RS-422; USB adapter
+    max_range_m: 300
+    confidence: unverified
+    notes: >-
+      Rated 300 m on natural surfaces (3000 m on a reflector plate). ASCII 8N1,
+      1.2 to 460.8 kBaud; factory baud and line format not confirmed (9600 is a
+      guess from the sibling LDM41). Set it to autostart measuring.
+    source: https://www.jenoptik.us/-/media/websitedocuments/optics/sensor/ldm-301-laser-distanzsensor-distanzmessgeraet.pdf
+
+  - id: lightware-grf500
+    name: LightWare GRF-500
+    driver: lightware_binary
+    init_script: lightware_grf_stream
+    baud: 115200
+    interface: 3.3 V UART (direct to Pi pins 8/10) or USB-TTL
+    max_range_m: 500
+    confidence: secondary
+    notes: >-
+      0.2 to 500 m (40% albedo, 4x4 m target), 5 Hz default. Binary LightWare
+      protocol; AeroLab-Pi sends the wake-up and start-streaming packets on
+      open. Framing from ArduPilot's driver.
+    source: https://mm.digikey.com/Volume0/opasdata/d220001/medias/docus/7153/LightWareGRF500PreliminarySpecifications.pdf
+
+  - id: lightware-sf11c
+    name: LightWare SF11/C
+    driver: ascii_number
+    driver_options: {invalid: [130.0]}
+    poll: "d\r\n"
+    poll_hz: 10
+    baud: 115200
+    interface: 3.3 V UART or USB
+    max_range_m: 120
+    confidence: manual
+    notes: >-
+      0.1 to 120 m on natural targets, 20 readings/s. ASCII metres. Units made
+      before May 2018 default to 19200 baud. Reports 130.00 on lost signal,
+      which AeroLab-Pi ignores. Polled with "d".
+    source: https://shop.mikrokopter.de/images/SF11ManualRev4.pdf
+
+  - id: lightware-lw20c
+    name: LightWare LW20/C
+    driver: ascii_number
+    init: "www\r\n"
+    poll: "?LD\r\n"
+    poll_hz: 10
+    baud: 115200
+    interface: 3.3 V UART
+    max_range_m: 100
+    confidence: secondary
+    notes: >-
+      Rated 100 m (users report about 60 m in practice). Starts in dual I2C/serial
+      mode; "www" switches it to serial. 19200 baud on units before mid-2018.
+    source: https://ardupilot.org/copter/docs/common-lightware-lw20-lidar.html
+
+  - id: benewake-tf03-180
+    name: Benewake TF03-180
+    driver: benewake
+    driver_options: {invalid_cm: [18000]}
+    baud: 115200
+    interface: 3.3 V UART (UART version), direct to Pi pins 8/10
+    max_range_m: 180
+    confidence: manual
+    notes: >-
+      180 m at 90% reflectivity, 70 m at 10%; 100 Hz. Streams 9-byte frames by
+      default. Out of range reads 18000 cm, which AeroLab-Pi ignores. The
+      RS-485/RS-232 version's UART is debug only.
+    source: https://cdn.sparkfun.com/assets/c/e/0/9/c/TF03_Datasheet_V1.0_EN.pdf
+
+  - id: benewake-tf02-pro
+    name: Benewake TF02-Pro
+    driver: benewake
+    driver_options: {invalid_cm: [4500]}
+    baud: 115200
+    interface: 3.3 V UART
+    max_range_m: 40
+    confidence: manual
+    notes: >-
+      About 40 m in practice; reads 4500 cm when the return is weak, which
+      AeroLab-Pi ignores. Bench and drone use, not aircraft altitudes.
+    source: https://xcopter.com/download/TF02-Pro_A01_Product_Manual.pdf
+
+  - id: generic-ascii-m
+    name: Generic serial laser (ASCII metres)
+    driver: ascii_number
+    baud: 115200
+    interface: any serial
+    max_range_m: 0
+    confidence: manual
+    notes: First number on each line is the range in metres.
+
+  - id: generic-ascii-cm
+    name: Generic serial laser (ASCII centimetres)
+    driver: ascii_number
+    unit: cm
+    baud: 115200
+    interface: any serial
+    max_range_m: 0
+    confidence: manual
+    notes: First number on each line is the range in centimetres.
+
+gnss:
+  - id: ublox-zed-f9p
+    name: u-blox ZED-F9P (RTK)
+    driver: nmea
+    baud: 38400
+    interface: 3.3 V UART1 or USB (USB ignores baud)
+    confidence: manual
+    notes: >-
+      NMEA GGA/RMC on by default at 38400. Timepulse (PPS) on the TIMEPULSE pin,
+      100 ms rising at the top of each second, only after GNSS time is valid.
+      Default NMEA does not carry full RTK precision; log UBX for post-processing.
+    source: https://content.u-blox.com/sites/default/files/documents/u-blox-F9-HPG-1.32_InterfaceDescription_UBX-22008968.pdf
+
+  - id: ublox-neo-m9n
+    name: u-blox NEO-M9N
+    driver: nmea
+    baud: 38400
+    interface: 3.3 V UART or USB
+    confidence: manual
+    notes: NMEA 4.10 GGA/RMC by default at 38400.
+    source: https://cdn.sparkfun.com/assets/5/d/7/8/3/NEO-M9N_Integrationmanual__UBX-19014286_.pdf
+
+  - id: ublox-neo-m8n
+    name: u-blox NEO-M8N
+    driver: nmea
+    baud: 9600
+    interface: 3.3 V UART or USB
+    confidence: manual
+    notes: NMEA GGA/RMC by default at 9600; 1 PPS timepulse.
+    source: https://content.u-blox.com/sites/default/files/NEO-M8-FW3_DataSheet_UBX-15031086.pdf
+
+  - id: septentrio-mosaic-x5
+    name: Septentrio mosaic-X5
+    driver: nmea
+    baud: 115200
+    interface: 3.3 V UART or USB
+    confidence: secondary
+    notes: >-
+      COM ports default to 115200. NMEA output must be switched on
+      (setNMEAOutput / web UI): enable GGA at 5-10 Hz on the port the Pi reads.
+    source: https://docs.sparkfun.com/SparkFun_RTK_mosaic-X5/software_overview
+
+  - id: novatel-oem7
+    name: NovAtel OEM7 (OEM729 / OEM7720 / PwrPak7)
+    driver: nmea
+    init: "log gpgga ontime 0.2\r\n"
+    baud: 9600
+    interface: LVCMOS or RS-232 depending on port; check yours
+    confidence: secondary
+    notes: >-
+      COM ports default to 9600 8N1. AeroLab-Pi asks for GPGGA at 5 Hz when the
+      port opens. PPS default is 1 ms, active low.
+    source: https://docs.novatel.com/OEM7/Content/Logs/GPGGA.htm
+
+  - id: vectornav-vn200
+    name: VectorNav VN-200 (GNSS/INS)
+    driver: vectornav_ins
+    baud: 115200
+    interface: RS-232 (port 1, rugged) or 3.3 V TTL (port 2)
+    confidence: manual
+    provides_attitude: true
+    notes: >-
+      GNSS/INS: position and attitude from one box, $VNINS at 40 Hz by default.
+      Height is above the ellipsoid (HAE), shown as HAE on the display.
+      Satellite count is not in $VNINS.
+    source: https://www.navtechgps.com/wp-content/uploads/assets/1/7/VN200_UserManual_UM0004.pdf
+
+  - id: vectornav-vn300
+    name: VectorNav VN-300 (dual-antenna GNSS/INS)
+    driver: vectornav_ins
+    baud: 115200
+    interface: RS-232 or 3.3 V TTL
+    confidence: unverified
+    provides_attitude: true
+    notes: >-
+      Same $VNINS ASCII format as the VN-200 is expected; factory defaults not
+      confirmed. Set async output to INS (register 6 = 22 on VN-200 firmware).
+    source: https://www.vectornav.com/products/detail/vn-300
+
+  - id: sbg-ellipse-n
+    name: SBG Ellipse-N / Ellipse-D (GNSS/INS, NMEA mode)
+    driver: nmea_ins
+    baud: 115200
+    interface: RS-232 (Port A) or RS-422; USB adapter
+    confidence: secondary
+    provides_attitude: true
+    notes: >-
+      Configure Port A for NMEA: GGA and PASHR (attitude) at 5-10 Hz. Factory
+      baud not confirmed; set 115200 in the SBG web/sbgCenter tool.
+    source: https://support.sbg-systems.com/sc/dev/files/latest/20940670/85788718/1/1706883147507/sbgECom+-+Firmware+Reference+Manual+-+2.3.pdf
+
+  - id: applanix-apx15
+    name: Applanix APX-15 UAV (NMEA mode)
+    driver: nmea_ins
+    baud: 115200
+    interface: RS-232; USB adapter
+    confidence: unverified
+    provides_attitude: true
+    notes: >-
+      NMEA or GSOF, set in its web UI. Enable GGA (and an attitude sentence such
+      as PASHR if offered) on the serial port. Defaults not confirmed.
+    source: https://www.applanix.com/products/dg-uavs.htm
+
+  - id: mavlink-fc
+    name: Flight controller via MAVLink (ArduPilot / PX4)
+    driver: mavlink
+    baud: 57600
+    interface: TELEM port, 3.3 V UART
+    confidence: secondary
+    provides_attitude: true
+    notes: >-
+      Reads ATTITUDE and GPS_RAW_INT. Needs pymavlink (the installer adds it).
+      ArduPilot TELEM1/2 default to MAVLink2 at 57600.
+    source: https://mavlink.io/en/messages/common.html
+
+  - id: generic-nmea
+    name: Generic NMEA GNSS
+    driver: nmea
+    baud: 9600
+    interface: any serial
+    confidence: manual
+    notes: Any receiver sending GGA. Check its baud.
+
+attitude:
+  - id: from-gnss
+    name: From the GNSS/INS above (no separate sensor)
+    driver: none
+    notes: Use when the GNSS/INS already provides roll, pitch and heading.
+
+  - id: vectornav-vn100
+    name: VectorNav VN-100 (AHRS)
+    driver: vectornav
+    baud: 115200
+    interface: RS-232 (rugged) or 3.3 V TTL
+    confidence: manual
+    notes: $VNYMR at 40 Hz by default; magnetic heading.
+    source: https://www.navtechgps.com/wp-content/uploads/assets/1/7/VN100-T_UserManual-UM001.pdf
+
+  - id: bno085-rvc
+    name: Bosch/CEVA BNO085 / BNO086 (UART-RVC)
+    driver: bno08x_rvc
+    baud: 115200
+    interface: 3.3 V UART (strap PS1=0, PS0=1)
+    confidence: manual
+    notes: >-
+      Low-cost IMU, 100 Hz. Heading is relative to power-on, not magnetic north,
+      so use it for roll/pitch (AGL correction), not georeferenced heading.
+    source: https://www.ceva-ip.com/wp-content/uploads/BNO080_085-Datasheet.pdf
+
+  - id: sbg-ellipse-a
+    name: SBG Ellipse-A (AHRS, NMEA mode)
+    driver: nmea_ins
+    baud: 115200
+    interface: RS-232/RS-422; USB adapter
+    confidence: secondary
+    notes: Configure PASHR output. Factory baud not confirmed.
+    source: https://support.sbg-systems.com/sc/el/latest/ellipse-documentation
+
+  - id: mavlink-attitude
+    name: Flight controller via MAVLink (attitude only)
+    driver: mavlink
+    baud: 57600
+    interface: TELEM port, 3.3 V UART
+    confidence: secondary
+    notes: Uses ATTITUDE. Needs pymavlink.
+    source: https://mavlink.io/en/messages/common.html
+
+  - id: generic-csv
+    name: Generic "roll,pitch,yaw" lines (e.g. a microcontroller)
+    driver: csv_rpy
+    baud: 115200
+    interface: any serial
+    confidence: manual
+    notes: Degrees, one line per reading.
+
+payloads:
+  - id: cresis-snow-radar
+    name: CReSIS / KU 2-8 GHz snow radar
+    kind: radar
+    trigger: none
+    confidence: secondary
+    notes: >-
+      FMCW snow radar with its own GPS receiver in the chassis; it records
+      continuously and needs no trigger. Line up its data with AeroLab-Pi's
+      attitude log by GPS time in processing (antenna lever arm and roll/pitch
+      corrections use the INS trajectory).
+    source: https://par.nsf.gov/servlets/purl/10629665
+
+  - id: micasense-altum-pt
+    name: MicaSense Altum-PT / RedEdge-P (trigger pin)
+    kind: camera
+    trigger: gpio
+    pulse_width_ms: 20
+    active_high: true
+    confidence: secondary
+    notes: >-
+      Set the camera's trigger input to rising edge. Nominal 3 V input, so the
+      Pi's 3.3 V output works; join grounds at the camera's isolated ground pin.
+      Minimum pulse width not published; 20 ms has margin. The camera geotags
+      from its own DLS 2 unless fed MAVLink.
+    source: https://xcopter.com/download/Altum-PT%20Integration%20Guide-Feb2022.pdf
+
+  - id: micasense-http
+    name: MicaSense Altum-PT / RedEdge-P (HTTP capture over Ethernet)
+    kind: camera
+    trigger: http
+    http_url: http://192.168.1.83/capture
+    confidence: manual
+    notes: >-
+      No trigger wire: AeroLab-Pi asks the camera to capture over Ethernet
+      (default 192.168.1.83). Timing jitter is higher than a wired trigger.
+    source: https://xcopter.com/download/Altum-PT%20Integration%20Guide-Feb2022.pdf
+
+  - id: sentera-6x
+    name: Sentera 6X
+    kind: camera
+    trigger: gpio
+    pulse_width_ms: 60
+    active_high: true
+    confidence: manual
+    notes: >-
+      3.3 V trigger on J2; the input must be stable for 50 ms, so pulses are
+      60 ms and the rate is capped well below 8 Hz.
+    source: https://sentera.gitbook.io/6x-multispectral-sensor-user-guide/6x-multispectral-sensor/configuration-and-settings/configuration
+
+  - id: generic-camera
+    name: Generic camera or payload (3.3 V trigger pulse)
+    kind: camera
+    trigger: gpio
+    pulse_width_ms: 20
+    active_high: true
+    confidence: manual
+    notes: Use an optocoupler for cameras that expect a contact closure.
+
+  - id: none
+    name: No triggered payload
+    kind: none
+    trigger: none
+
+profiles:
+  - id: airborne-snow-survey
+    name: Airborne snow survey, light aircraft (snow radar + laser + multispectral + GNSS/INS)
+    gnss: vectornav-vn200
+    attitude: from-gnss
+    laser: riegl-ld90-3800
+    payloads: [cresis-snow-radar, micasense-altum-pt]
+    trigger_hz: 1.0
+    survey_agl_ft: 2250
+    low_agl_warn_ft: 1500
+    notes: >-
+      An estimate for a light-aircraft ice survey at 2000-2500 ft AGL: GNSS/INS
+      for position and attitude, a long-range laser altimeter, a 2-8 GHz snow
+      radar recording on its own GPS, and a multispectral camera triggered
+      once a second. At that height, short-range lidars (SF11, TF03, GRF-500)
+      read nothing; plan on a laser rated past 760 m.
+
+  - id: survey-budget
+    name: Survey on a budget (u-blox RTK + BNO085 + TF03 + MicaSense)
+    gnss: ublox-zed-f9p
+    attitude: bno085-rvc
+    laser: benewake-tf03-180
+    payloads: [micasense-altum-pt]
+    trigger_hz: 1.0
+    survey_agl_ft: 400
+    low_agl_warn_ft: 200
+    notes: Low-cost kit for flying under about 500 ft AGL (laser limit 180 m at best).
+
+  - id: midrange-aircraft
+    name: Mid-range laser altimetry (ZED-F9P + VN-100 + GRF-500 + Sentera 6X)
+    gnss: ublox-zed-f9p
+    attitude: vectornav-vn100
+    laser: lightware-grf500
+    payloads: [sentera-6x]
+    trigger_hz: 1.0
+    survey_agl_ft: 1000
+    low_agl_warn_ft: 500
+    notes: Laser good to about 500 m on a good target; plan surveys under about 1500 ft AGL.
+
+  - id: flight-controller
+    name: Drone or flight controller as the nav source (MAVLink + TF03 + camera)
+    gnss: mavlink-fc
+    attitude: from-gnss
+    laser: benewake-tf03-180
+    payloads: [generic-camera]
+    trigger_hz: 1.0
+    survey_agl_ft: 300
+    low_agl_warn_ft: 100
+    notes: ArduPilot/PX4 supplies position and attitude over one MAVLink link.
+
+  - id: bench-generic
+    name: Generic serial sensors (NMEA GNSS + ASCII laser + roll,pitch,yaw IMU)
+    gnss: generic-nmea
+    attitude: generic-csv
+    laser: generic-ascii-m
+    payloads: [generic-camera]
+    trigger_hz: 1.0
+    survey_agl_ft: 500
+    low_agl_warn_ft: 200
+    notes: The original AeroLab-Pi defaults.

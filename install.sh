@@ -2,7 +2,7 @@
 # One-command Raspberry Pi installer: headless, starts on boot.
 #
 #   ./install.sh             asks setup questions with menus (ports, trigger, logging, hotspot)
-#   ./install.sh --defaults  no questions; uses config/sensors.yaml as is
+#   ./install.sh --defaults  no questions; the default profile (airborne snow survey)
 #   ./install.sh --sim       no questions; simulated sensors (bench test with nothing wired)
 #
 # Safe to run again after a `git pull`. Change settings later with ./configure.sh.
@@ -55,6 +55,21 @@ else
     echo "Setup cancelled. Run ./install.sh again, or ./install.sh --defaults."
     exit 1
   }
+fi
+
+# Extras the chosen hardware needs.
+NEEDS="$("$APP_DIR/.venv/bin/python" "$APP_DIR/scripts/configure.py" --needs)"
+if grep -qx pymavlink <<<"$NEEDS"; then
+  "$APP_DIR/.venv/bin/pip" install pymavlink
+fi
+MODEL="$(grep '^ollama:' <<<"$NEEDS" | cut -d: -f2- || true)"
+if [[ -n "$MODEL" ]]; then
+  if ! command -v ollama >/dev/null 2>&1; then
+    echo "Buddy AI: installing Ollama (local model runner) from ollama.com"
+    curl -fsSL https://ollama.com/install.sh | sh
+  fi
+  echo "Buddy AI: downloading $MODEL (one time, needs internet)"
+  ollama pull "$MODEL" || echo "Could not download $MODEL. Buddy will use plain answers until it is installed."
 fi
 
 sudo tee /etc/systemd/system/aerolab.service > /dev/null <<EOF
