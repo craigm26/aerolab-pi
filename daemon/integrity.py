@@ -59,9 +59,11 @@ class SensorMonitor:
         self.window_s = window_s
         self.times: deque = deque()
         self.last = 0.0
+        self.total = 0                      # every reading since start (survey confirmation counts these)
         self._counts: deque = deque()      # (time, good, bad) snapshots of the driver counters
 
     def on_reading(self, now: float):
+        self.total += 1
         self.last = now
         self.times.append(now)
         self._trim(now)

@@ -118,6 +118,8 @@ def main(argv=None):
     ap.add_argument("--max-gap-s", type=float, default=0.6)
     ap.add_argument("--offset-m", type=float, help="laser mounting offset (default: from calibration)")
     ap.add_argument("--out")
+    ap.add_argument("--from-mono-ns", type=int, help="only readings at or after this monotonic time (a survey start)")
+    ap.add_argument("--to-mono-ns", type=int, help="only readings at or before this monotonic time (a survey stop)")
     a = ap.parse_args(argv)
 
     db = Path(a.db) if a.db else next((p for p in (Path("/mnt/ssd/aerolab_logs/aerolab_flight.db"),
@@ -126,8 +128,9 @@ def main(argv=None):
         raise SystemExit("No flight database found; pass --db")
     conn = sqlite3.connect(db)
     fid = a.flight or conn.execute("SELECT MAX(flight_id) FROM laser_readings").fetchone()[0]
+    lo, hi = a.from_mono_ns or 0, a.to_mono_ns or 2 ** 62
     laser = conn.execute("SELECT utc_ns, mono_ns, range_m, accepted FROM laser_readings WHERE flight_id=? "
-                         "ORDER BY mono_ns", (fid,)).fetchall()
+                         "AND mono_ns BETWEEN ? AND ? ORDER BY mono_ns", (fid, lo, hi)).fetchall()
     fixes = conn.execute("SELECT utc_ns, mono_ns, gnss_tod, lat, lon, alt_m, alt_ref, fix, sats, hdop FROM gnss_fixes "
                          "WHERE flight_id=? AND lat IS NOT NULL ORDER BY mono_ns", (fid,)).fetchall()
     pps = conn.execute("SELECT assert_utc_ns, utc_minus_mono_ns FROM pps_edges WHERE flight_id=? ORDER BY seq",
@@ -184,7 +187,8 @@ def main(argv=None):
                 n_gap += 1
                 gaps.append(t)
             iso = datetime.fromtimestamp(t, timezone.utc).isoformat(timespec="milliseconds")
-            w.writerow([f"{t:.6f}", iso, f"{rng:.3f}", acc, f"{rng - offset:.3f}", f"{lat:.8f}", f"{lon:.8f}",
+            w.writerow([f"{t:.6f}", iso, "" if rng is None else f"{rng:.3f}", acc,
+                        "" if rng is None else f"{rng - offset:.3f}", f"{lat:.8f}", f"{lon:.8f}",
                         "" if alt is None else f"{alt:.3f}", fx[6], fx[7], fx[8], fx[9], f"{near:.3f}", match,
                         utc_ns, mono_ns])
     summary = {"flight": fid, "laser_readings": len(laser), "matched": n_ok, "not_matched": n_gap,

@@ -135,6 +135,63 @@ Tap **BUDDY** on the display. Four tabs: **Callouts**, **Checks** (ground check,
 
 Buddy is meant for the ground and for crew. A solo pilot should not be typing in flight; the spoken callouts are the in-flight part.
 
+## Survey control: START / STOP from the iPad
+
+Tap **SURVEY** in the status bar.
+
+The Pi records whenever the instruments are powered, so nothing is lost if START is never pressed. A survey marks the window that matters and does the rest.
+
+**START SURVEY:**
+1. Runs the readiness check, and shows go or no-go with the problems and their fixes. You can START ANYWAY.
+2. Switches the RedEdge-P's timer capture on over Ethernet (if setup was allowed to control it).
+3. Within 15 s, confirms every instrument is really recording into this survey: new laser readings, new GNSS fixes with a fix, new camera exposures, rows reaching the disk, and raw bytes growing.
+
+   It says "Confirmed: everything is recording", or names what isn't. Buddy calls it out too.
+
+**While recording:** a red REC timer in the status bar, plus live counts of laser readings (and how many had a ground return), fixes, exposures, saved rows and raw data.
+
+**HOLD TO STOP SURVEY** (1.5 s, so a bump can't stop it):
+1. Switches the camera's capture off, flushes and fsyncs everything.
+2. Builds the survey package in `surveys/survey_<n>_<time>/` on the log disk:
+   - a consistent copy of the flight database;
+   - `laser_points.csv` and `exposures.csv` for the survey window on GNSS time;
+   - `camera_status.jsonl`;
+   - the raw captures;
+   - `readiness.html` and `survey.json`;
+   - `MANIFEST.sha256`.
+3. Copies the package to every backup drive and re-reads each copy against the manifest.
+
+It reports "Saved: N files, X MB, verified on 2 of 2 drive(s)".
+
+**HOLD TO SHUT DOWN SAFELY** (2 s), for switching the science equipment off on transit legs:
+1. Stops any survey.
+2. Asks the RedEdge-P to park its card (`/powerdownready`).
+3. Flushes everything and powers off the Pi.
+
+Switch the power off when the Pi's green LED stops.
+
+**The Reach M2's own raw log** has no remote control. In Emlid Flow, set raw logging to start automatically on power-up. The survey confirms the Reach's NMEA stream, not its internal log.
+
+**What the second drive gets:**
+- **Continuously:** raw sensor captures.
+- **At every STOP:** the whole survey package, including the database, exports, camera status and reports, verified by SHA-256.
+
+The camera's images stay on its own card.
+
+## Bench tools for the installation
+
+Run these on the bench to prove each connection, in order. Full steps are in [docs/bench-checklist.md](docs/bench-checklist.md).
+
+| Tool | Proves |
+|---|---|
+| `python scripts/probe.py <port> --loopback` | USB-RS232 adapter and cable, with DB9 pins 2 and 3 bridged |
+| `python scripts/probe.py <port>` | which protocol and baud a device is sending (e.g. the ILM-150-R through the Souriau harness) |
+| `./bench.sh --laser-distance 12.40` | laser against a tape-measured distance: bias, noise, no-return rate |
+| `python tools/timing_check.py` | PPS present, 1-second intervals (µs jitter), missing pulses, the Pi clock vs GPS, clock steps, NMEA latency |
+| `./bench.sh --camera-test` | the camera's Top-of-Frame reaches the Pi; with Ethernet, the capture-to-edge time |
+| `python tools/compare_timemarks.py --events reach.pos` | every exposure is in both the Reach time-mark log and the Pi's record; the offset between them |
+| `./bench.sh` | one HTML + JSON report of everything, to send back |
+
 ## Data you don't lose
 
 **Every reading, not samples.** Each laser range and each GNSS fix is written to its own table (`laser_readings`, `gnss_fixes`) with two timestamps taken the moment its bytes arrived:
@@ -408,8 +465,8 @@ A VectorNav GNSS/INS reports height above the ellipsoid, not sea level. The disp
 
 ```bash
 .venv/bin/pip install -r requirements-dev.txt
-.venv/bin/python -m pytest -m "not slow"     # 100 tests, about 25 s
-.venv/bin/python -m pytest                   # plus 3 end-to-end virtual flights, about 2.5 min
+.venv/bin/python -m pytest -m "not slow"     # 107 tests, about 1 min
+.venv/bin/python -m pytest                   # plus 3 end-to-end virtual flights, about 3.5 min
 python tools/virtual_flight.py               # every profile, with a full report
 ```
 

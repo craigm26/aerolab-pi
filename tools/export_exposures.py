@@ -34,6 +34,8 @@ def main(argv=None):
     ap.add_argument("--latency-ms", type=float, default=0.0)
     ap.add_argument("--max-gap-s", type=float, default=0.6)
     ap.add_argument("--out")
+    ap.add_argument("--from-mono-ns", type=int, help="only readings at or after this monotonic time (a survey start)")
+    ap.add_argument("--to-mono-ns", type=int, help="only readings at or before this monotonic time (a survey stop)")
     a = ap.parse_args(argv)
     db = Path(a.db) if a.db else next((p for p in (Path("/mnt/ssd/aerolab_logs/aerolab_flight.db"),
                                                    el.ROOT / "logs" / "aerolab_flight.db") if p.exists()), None)
@@ -41,7 +43,9 @@ def main(argv=None):
         raise SystemExit("No flight database found; pass --db")
     conn = sqlite3.connect(db)
     fid = a.flight or conn.execute("SELECT MAX(flight_id) FROM exposures").fetchone()[0]
-    ex = conn.execute("SELECT seq, utc_ns, mono_ns FROM exposures WHERE flight_id=? ORDER BY mono_ns", (fid,)).fetchall()
+    lo, hi = a.from_mono_ns or 0, a.to_mono_ns or 2 ** 62
+    ex = conn.execute("SELECT seq, utc_ns, mono_ns FROM exposures WHERE flight_id=? AND mono_ns BETWEEN ? AND ? "
+                      "ORDER BY mono_ns", (fid, lo, hi)).fetchall()
     fixes = conn.execute("SELECT utc_ns, mono_ns, gnss_tod, lat, lon, alt_m, alt_ref, fix FROM gnss_fixes "
                          "WHERE flight_id=? AND lat IS NOT NULL ORDER BY mono_ns", (fid,)).fetchall()
     pps = conn.execute("SELECT assert_utc_ns, utc_minus_mono_ns FROM pps_edges WHERE flight_id=? ORDER BY seq",

@@ -140,6 +140,27 @@
     .cmp { display: grid; grid-template-columns: 1.4fr 1fr 1fr; gap: 4px 8px; font-size: 0.8rem; }
     .cmp .h { color: var(--muted); font-size: 0.7rem; }
 
+    /* ---- survey sheet ---- */
+    #p-survey { border-color: var(--ok); color: var(--ok); }
+    #p-survey.rec { border-color: var(--err); color: #fff; background: #3a0d05; animation: recpulse 1.4s ease-in-out infinite; }
+    @keyframes recpulse { 50% { background: #5a1408; } }
+    #sheet { position: fixed; inset: 0; z-index: 60; background: rgba(0,0,0,0.88); display: none; align-items: center; justify-content: center; padding: 16px; }
+    #sheet.open { display: flex; }
+    .sheet-card { width: min(640px, 100%); max-height: 100%; overflow-y: auto; background: #0b0e12; border: 1px solid var(--border); border-radius: 14px; padding: 18px; display: flex; flex-direction: column; gap: 12px; }
+    .sheet-title { font-weight: 900; letter-spacing: 3px; color: var(--accent); display: flex; justify-content: space-between; align-items: center; }
+    .huge { width: 100%; border: none; border-radius: 12px; padding: 22px 12px; font-size: 1.5rem; font-weight: 900; letter-spacing: 2px; position: relative; overflow: hidden; color: #000; }
+    .huge.go { background: var(--ok); } .huge.stop { background: var(--err); color: #fff; } .huge.amber { background: var(--warn); }
+    .huge.ghost { background: var(--panel); color: var(--muted); border: 1px solid var(--border); font-size: 1rem; padding: 14px; }
+    .huge .fill { position: absolute; left: 0; top: 0; bottom: 0; width: 0; background: rgba(255,255,255,0.35); }
+    .huge span { position: relative; }
+    .counts { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 8px; }
+    .count { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 10px; }
+    .count b { display: block; font-size: 1.5rem; } .count span { color: var(--muted); font-size: 0.72rem; letter-spacing: 1px; }
+    .elapsed { font-size: 2.6rem; font-weight: 900; text-align: center; font-variant-numeric: tabular-nums; }
+    .conf { display: flex; flex-direction: column; gap: 4px; font-size: 0.85rem; }
+    .conf .y { color: var(--ok); } .conf .n { color: var(--err); }
+    .msgline { padding: 10px; border-radius: 8px; background: var(--panel); font-weight: 700; }
+
     /* ---- boot sequence ---- */
     #boot { position: fixed; inset: 0; z-index: 100; background: radial-gradient(ellipse at 50% 40%, #07141f 0%, #000 70%); display: flex; flex-direction: column;
             align-items: center; justify-content: center; gap: 18px; padding: 24px; transition: opacity 500ms ease, transform 600ms cubic-bezier(.2,.8,.2,1); }
@@ -221,6 +242,7 @@
     <div id="p-imu" class="pill err">IMU</div>
     <div id="p-log" class="pill err">LOG</div>
     <div id="p-sync" class="pill">TRIG: 0</div>
+    <button id="p-survey" class="pill" aria-label="Survey">SURVEY</button>
     <button id="p-buddy" class="pill" aria-label="Open Buddy">BUDDY<span class="badge" id="badge">0</span></button>
   </div>
 
@@ -254,6 +276,14 @@
     <div id="coords">LAT: --- | LON: ---</div>
     <div id="logfile">LOG: ---</div>
     <div id="utc">UTC: --:--:--</div>
+  </div>
+
+  <!-- ======== survey sheet ======== -->
+  <div id="sheet" role="dialog" aria-label="Survey">
+    <div class="sheet-card">
+      <div class="sheet-title"><span id="sv-title">SURVEY</span><button class="b-close" id="sv-close">CLOSE</button></div>
+      <div id="sv-body" style="display:flex;flex-direction:column;gap:12px"></div>
+    </div>
   </div>
 
   <!-- ======== buddy panel ======== -->
@@ -538,6 +568,7 @@
       renderHealth(d);
       renderCal(d);
       renderReady(d);
+      renderSurveyPill(d);
       $("agl-label").textContent = (d._configured || {}).imu === false ? "LASER AGL · NOT TILT-CORRECTED" : "TILT-CORRECTED AGL";
       $("flightinfo").textContent = `Flight ${d.flight_id}`;
       const ai = d._ai || {};
@@ -714,6 +745,110 @@
     }
     $("askform").onsubmit = (e) => { e.preventDefault(); const q = $("q").value.trim(); if (q) { $("q").value = ""; ask(q); } };
     document.querySelectorAll(".chip").forEach((c) => c.onclick = () => ask(c.textContent));
+
+    /* ------------------------------------------------------------ survey */
+    let svPending = null;          // readiness result waiting for "start anyway"
+    let svBusy = false;
+    let sdState = null;            // shutdown flow
+    const fmtDur = (s) => { s = Math.max(0, Math.floor(s)); const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), x = s % 60;
+      return (h ? h + ":" + String(m).padStart(2, "0") : m) + ":" + String(x).padStart(2, "0"); };
+    function holdButton(id, ms, onDone) {
+      const el = $(id); if (!el) return;
+      const fill = el.querySelector(".fill");
+      let t0 = 0, raf = 0;
+      const tick = () => { const k = Math.min(1, (performance.now() - t0) / ms); fill.style.width = (k * 100) + "%";
+        if (k >= 1) { cancelAnimationFrame(raf); fill.style.width = "0"; onDone(); } else raf = requestAnimationFrame(tick); };
+      const down = (e) => { e.preventDefault(); t0 = performance.now(); raf = requestAnimationFrame(tick); };
+      const up = () => { cancelAnimationFrame(raf); fill.style.width = "0"; };
+      el.addEventListener("pointerdown", down); el.addEventListener("pointerup", up); el.addEventListener("pointerleave", up);
+    }
+    function renderSurveyPill(d) {
+      const sv = d._survey || {}, el = $("p-survey");
+      if (sv.state === "recording" && sv.current) { el.className = "pill rec"; el.textContent = `● REC ${fmtDur(sv.current.elapsed_s)}`; }
+      else if (sv.state === "stopping") { el.className = "pill warn"; el.textContent = "SAVING..."; }
+      else { el.className = "pill"; el.id = "p-survey"; el.textContent = "SURVEY"; }
+      if ($("sheet").classList.contains("open")) renderSheet(d);
+    }
+    function renderSheet(d) {
+      const sv = d._survey || {}, body = $("sv-body");
+      if (sdState) {
+        const st = d._shutdown || {};
+        body.innerHTML = `<div class="msgline">${esc(st.state === "powering_off" ? "Powering off" : st.state === "ready" ? "Ready to switch off" : "Shutting down safely...")}</div>` +
+          `<div class="conf">${(st.steps || []).map((x) => `<div class="${x.ok ? "y" : "n"}">${x.ok ? "✓" : "✗"} ${esc(x.step)}: ${esc(x.detail)}</div>`).join("")}</div>` +
+          `<div class="note">${esc(st.detail || "")}</div>`;
+        return;
+      }
+      if (svPending) {
+        const r = svPending.readiness;
+        body.innerHTML = `<div class="ready-box ${r.verdict.level}">${esc(r.verdict.text)}</div>` +
+          r.findings.filter((f) => f.severity !== "info").map((f) => `<div class="fnd ${f.severity}"><b>${esc(f.title)}</b>` +
+            (f.steps.length ? `<ol><li>${esc(f.steps[0])}</li></ol>` : "") + `</div>`).join("") +
+          `<button class="huge amber" id="sv-force"><span>START ANYWAY</span></button>` +
+          `<button class="huge ghost" id="sv-cancel"><span>CANCEL</span></button>`;
+        $("sv-force").onclick = () => startSurvey(true);
+        $("sv-cancel").onclick = () => { svPending = null; renderSheet(last || {}); };
+        return;
+      }
+      if (sv.state === "recording" && sv.current) {
+        const c = sv.current, x = c.since_start || {}, conf = c.confirmation;
+        $("sv-title").textContent = c.name.toUpperCase();
+        if (!$("sv-stop")) {
+          body.innerHTML = `<div class="elapsed" id="sv-el"></div><div class="msgline" id="sv-msg"></div><div class="conf" id="sv-conf"></div>` +
+            `<div class="counts" id="sv-counts"></div>` +
+            `<button class="huge stop" id="sv-stop"><div class="fill"></div><span>HOLD TO STOP SURVEY</span></button>`;
+          holdButton("sv-stop", 1500, stopSurvey);
+        }
+        $("sv-el").textContent = fmtDur(c.elapsed_s);
+        $("sv-msg").textContent = sv.message || "";
+        $("sv-msg").style.color = /NOT/.test(sv.message) ? "var(--err)" : (/Confirmed/.test(sv.message) ? "var(--ok)" : "var(--text)");
+        $("sv-conf").innerHTML = (conf || []).map((i) => `<div class="${i.ok ? "y" : "n"}">${i.ok ? "✓" : "✗"} ${esc(i.item)}: ${esc(i.detail)}</div>`).join("");
+        const cam = (d._camera || {}).enabled;
+        $("sv-counts").innerHTML = [["LASER READINGS", (x.laser_readings || 0).toLocaleString()], ["WITH GROUND RETURN", (x.laser_valid || 0).toLocaleString()],
+          ["GNSS FIXES", (x.gnss_fixes || 0).toLocaleString()], ...(cam ? [["EXPOSURES", (x.exposures || 0).toLocaleString()]] : []),
+          ["SAVED ROWS", (x.rows_written || 0).toLocaleString()], ["RAW DATA", ((x.raw_bytes || 0) / 1e6).toFixed(1) + " MB"]]
+          .map(([k, v]) => `<div class="count"><b>${v}</b><span>${k}</span></div>`).join("");
+        return;
+      }
+      if (sv.state === "stopping" || svBusy) {
+        body.innerHTML = `<div class="msgline">${esc(sv.message || "Working...")}</div>`;
+        return;
+      }
+      $("sv-title").textContent = "SURVEY";
+      const L = sv.last;
+      const key = `idle:${L ? L.id : ""}:${sv.message}`;
+      if (body.dataset.key === key && $("sv-start")) return;      // don't wipe what she's typing
+      body.dataset.key = key;
+      const lastHtml = L ? `<div class="sect">LAST: ${esc(L.name)}</div><div class="msgline" style="color:${L.package && L.package.ok ? "var(--ok)" : "var(--err)"}">${esc(sv.message)}</div>` +
+        `<div class="note">${fmtDur(L.duration_s)} · ${L.laser_readings.toLocaleString()} laser readings · ${L.gnss_fixes.toLocaleString()} fixes` +
+        `${L.exposures ? " · " + L.exposures.toLocaleString() + " exposures" : ""} · ${L.readings_lost} lost<br>${esc((L.package && L.package.dir) || "")}</div>` : "";
+      body.innerHTML = `<div class="note">The Pi records whenever the instruments are on. START marks the survey, starts the camera if it is under Pi control, and confirms every instrument is recording. STOP saves a verified copy to every backup drive.</div>` +
+        `<input id="sv-name" placeholder="Name (optional), e.g. Leg 3 ice shelf" style="background:var(--panel);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:12px;font:inherit;font-size:16px" />` +
+        `<button class="huge go" id="sv-start"><span>START SURVEY</span></button>` + lastHtml +
+        `<div class="sect">POWER</div><button class="huge ghost" id="sv-off"><div class="fill"></div><span>HOLD TO SHUT DOWN SAFELY</span></button>` +
+        `<div class="note">Stops any survey, parks the camera's card, saves everything, then powers off the Pi. Switch the power off when its green LED stops.</div>`;
+      $("sv-start").onclick = () => startSurvey(false);
+      holdButton("sv-off", 2000, shutdownPi);
+    }
+    async function startSurvey(force) {
+      svBusy = true;
+      const name = ($("sv-name") || {}).value || (svPending && svPending.name) || "";
+      const r = await (await fetch("/api/survey/start", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name, force }) })).json();
+      svBusy = false;
+      svPending = r.needs_confirmation ? { readiness: r.readiness, name } : null;
+      $("sv-body").innerHTML = ""; $("sv-body").dataset.key = "";
+      renderSheet(last || {});
+    }
+    async function stopSurvey() {
+      svBusy = true; $("sv-body").innerHTML = `<div class="msgline">Stopping: camera off, saving and backing up...</div>`;
+      await fetch("/api/survey/stop", { method: "POST" });
+      svBusy = false; $("sv-body").innerHTML = ""; $("sv-body").dataset.key = "";
+    }
+    async function shutdownPi() {
+      sdState = "running"; renderSheet(last || {});
+      await fetch("/api/shutdown", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ confirm: "SHUTDOWN" }) });
+    }
+    $("p-survey").onclick = () => { $("sheet").classList.add("open"); $("sv-body").innerHTML = ""; $("sv-body").dataset.key = ""; renderSheet(last || {}); };
+    $("sv-close").onclick = () => { $("sheet").classList.remove("open"); svPending = null; };
 
     /* ------------------------------------------------------------ link */
     function connect() {

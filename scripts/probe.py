@@ -92,12 +92,42 @@ def verdict(res: dict) -> str:
     return f"Found it: {g['best']} at {g['baud']} baud ({g['good']} good readings, {g['bad']} bad frames)."
 
 
+def loopback(port: str, baud: int = 9600) -> dict:
+    """Adapter + cable test: with the adapter's TX and RX bridged (DB9 pins 2 and 3), what goes out must come back."""
+    import serial
+    pattern = b"AeroLab loopback 0123456789 ~!@#$%^&*()\r\n" * 4
+    try:
+        with serial.Serial(port, baud, timeout=0.5) as ser:
+            ser.reset_input_buffer()
+            ser.write(pattern)
+            ser.flush()
+            got = bytearray()
+            end = time.monotonic() + 1.0 + len(pattern) * 10 / baud
+            while time.monotonic() < end and len(got) < len(pattern):
+                got += ser.read(len(pattern) - len(got))
+    except serial.SerialException as exc:
+        return {"ok": False, "detail": f"could not open {port}: {exc}"}
+    if bytes(got) == pattern:
+        return {"ok": True, "detail": f"{len(pattern)} bytes out and back intact at {baud} baud: adapter and cable are good"}
+    if not got:
+        return {"ok": False, "detail": "nothing came back: check the bridge is between pins 2 and 3 of the DB9, "
+                                      "or the adapter is faulty"}
+    return {"ok": False, "detail": f"{len(got)} of {len(pattern)} bytes came back, {sum(1 for a, b in zip(got, pattern) if a != b)} wrong: "
+                                   "a marginal adapter or cable"}
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("port")
+    ap.add_argument("--loopback", action="store_true",
+                    help="adapter test: bridge DB9 pins 2 and 3 (laser disconnected), then run this")
     ap.add_argument("--seconds", type=float, default=2.0)
     ap.add_argument("--bauds", type=int, nargs="*", default=BAUDS)
     a = ap.parse_args()
+    if a.loopback:
+        r = loopback(a.port, a.bauds[0] if len(a.bauds) == 1 else 9600)
+        print(("PASS: " if r["ok"] else "FAIL: ") + r["detail"])
+        sys.exit(0 if r["ok"] else 1)
     print(f"Probing {a.port} ...")
     res = probe(a.port, a.bauds, a.seconds)
     print("\n" + verdict(res))

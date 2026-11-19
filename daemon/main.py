@@ -37,6 +37,7 @@ import camera as camera_mod  # noqa: E402
 import diagnose  # noqa: E402
 import ppsclock  # noqa: E402
 import rawlog  # noqa: E402
+import survey as survey_mod  # noqa: E402
 from supervise import Supervisor, watchdog  # noqa: E402
 
 # gpiozero works on every Pi model including the Pi 5 (RPi.GPIO does not).
@@ -192,6 +193,9 @@ class AeroLabDaemon:
         self.state = TelemetryState(sim_mode=sim_mode, low_agl_warn_ft=float(hud.get("low_agl_warn_ft", 200)))
         self.last_seen = {"gnss": 0.0, "laser": 0.0, "imu": 0.0}
         self.laser_alive_at = 0.0
+        self.laser_valid_total = 0
+        from collections import deque as _dq
+        self.laser_recent = _dq(maxlen=5000)  # (monotonic s, range m or None) for bench checks
         self.laser_window: list = []          # (time, had a valid range) over the last 10 s
         self.clients: set[WebSocket] = set()
         self.tasks: list[asyncio.Task] = []
@@ -271,6 +275,8 @@ class AeroLabDaemon:
             self.buddy.configured = used
         self.ai_status: dict = {"available": False, "reason": "checking"}
         self.new_flight("boot")
+        self.survey = survey_mod.SurveyManager(self)
+        self.shutdown_state: dict = {"state": "running"}
 
     @classmethod
     def from_file(cls, config_path: str, sim_mode: bool = False) -> "AeroLabDaemon":
@@ -334,6 +340,59 @@ class AeroLabDaemon:
         conn.commit()
         conn.close()
         self.session_start = time.time()
+
+    async def flush_all(self):
+        """Everything queued or buffered goes to disk now (survey stop, shutdown)."""
+        conn = sqlite3.connect(self.db_path, timeout=10)
+        conn.executescript(rawlog.READINGS_SCHEMA)
+        try:
+            while self.readings.q:
+                self.readings._flush(conn)
+        finally:
+            conn.close()
+        for w in self.raw.values():
+            w.sync()
+
+    async def shutdown(self, dry_run: bool = False) -> dict:
+        """Safe power-off: stop any survey, park the camera's card, flush, then power off the Pi."""
+        steps = []
+        self.shutdown_state = {"state": "stopping", "steps": steps}
+        if self.survey.state == "recording":
+            r = await self.survey.stop()
+            steps.append({"step": "Stop survey", "ok": r.get("ok", False), "detail": self.survey.message})
+        cam = self.camera
+        if cam.enabled and cam.status_url and not self.sim_mode:
+            base = cam.status_url.rsplit("/status", 1)[0]
+            ok, detail = False, ""
+            try:
+                import httpx
+                async with httpx.AsyncClient(timeout=3.0) as client:
+                    await client.post(f"{base}/powerdownready", json={"power_down": True})
+                    for _ in range(30):
+                        r = (await client.get(f"{base}/powerdownready")).json()
+                        if r.get("ready_for_power_down"):
+                            ok = True
+                            break
+                        await asyncio.sleep(1.0)
+                detail = "camera storage unmounted, safe to cut its power" if ok else "camera did not confirm in 30 s"
+            except Exception as exc:
+                detail = f"camera not reachable ({exc}); hold its button 5 s before cutting power"
+            steps.append({"step": "Camera ready for power-off", "ok": ok, "detail": detail})
+        await self.flush_all()
+        steps.append({"step": "Flush data to disk", "ok": True, "detail": f"{self.readings.written} readings saved"})
+        self.buddy.emit("info", "Shutting down safely")
+        if dry_run or self.sim_mode:
+            self.shutdown_state = {"state": "ready", "steps": steps, "detail": "simulation: the Pi stays on"}
+            return self.shutdown_state
+        self.shutdown_state = {"state": "powering_off", "steps": steps,
+                               "detail": "the Pi powers off in a few seconds; wait for the green LED to stop"}
+
+        async def _off():
+            await asyncio.sleep(2.0)
+            proc = await asyncio.create_subprocess_exec("sudo", "-n", "/usr/bin/systemctl", "poweroff")
+            await proc.wait()
+        asyncio.create_task(_off())
+        return self.shutdown_state
 
     def _data_error(self, msg: str):
         """A write failed somewhere. Say so loudly, but at most once a minute per message."""
@@ -486,7 +545,8 @@ class AeroLabDaemon:
                 self._laser_seen(now, False)
                 self.readings.add("laser", (s.flight_id, utc_ns, mono_ns, rng, 0, None, s.roll_deg, s.pitch_deg))
                 return
-            self._laser_seen(now, True)
+            self._laser_seen(now, True, rng)
+            self.laser_valid_total += 1
             s.laser_raw_m = round(rng, 3)
             if self.capture:
                 self.capture.add(laser_raw=rng)
@@ -496,7 +556,8 @@ class AeroLabDaemon:
             self.readings.add("laser", (s.flight_id, utc_ns, mono_ns, rng, int(ok), s.agl_m if ok else None,
                                         s.roll_deg, s.pitch_deg))
 
-    def _laser_seen(self, now: float, valid: bool):
+    def _laser_seen(self, now: float, valid: bool, rng: float | None = None):
+        self.laser_recent.append((time.monotonic(), rng if valid else None))
         self.laser_alive_at = now
         w = self.laser_window
         w.append((now, valid))
@@ -537,7 +598,7 @@ class AeroLabDaemon:
         true_offset = float(sc.get("laser_offset_m", 0.62))
         survey_m = float((self.cfg.get("hud") or {}).get("survey_agl_ft", 0) or 0) / M_TO_FT
         center = survey_m if survey_m > 0 else 60.0
-        swing = 0.15 * center
+        swing = 0.10 * center
         rnd = random.Random(7)
         t = 0.0
         lat, lon = 38.5816, -121.4944
@@ -1064,6 +1125,8 @@ table{{border-collapse:collapse;width:100%}}td,th{{border-bottom:1px solid #eee;
         d["_data"] = self.data_status()
         d["_ready"] = self.ready
         d["_camera"] = self.camera.snapshot()
+        d["_survey"] = self.survey.status()
+        d["_shutdown"] = self.shutdown_state
         return json.dumps(d)
 
     def data_status(self) -> dict:
@@ -1171,6 +1234,88 @@ def create_app(daemon: AeroLabDaemon) -> FastAPI:
     @app.post("/api/bit/run")
     async def run_bit():
         return JSONResponse(await daemon.run_bit(delay=float(os.environ.get("AEROLAB_BIT_DELAY", 3.0))))
+
+    @app.get("/api/survey")
+    async def survey_status():
+        return JSONResponse(daemon.survey.status())
+
+    @app.post("/api/survey/readiness")
+    async def survey_readiness():
+        return JSONResponse(daemon.survey.readiness())
+
+    @app.post("/api/survey/start")
+    async def survey_start(request: Request):
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        return JSONResponse(await daemon.survey.start(str(body.get("name", ""))[:60], bool(body.get("force"))))
+
+    @app.post("/api/survey/stop")
+    async def survey_stop():
+        return JSONResponse(await daemon.survey.stop(), headers={"cache-control": "no-store"})
+
+    @app.post("/api/shutdown")
+    async def shutdown(request: Request):
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if body.get("confirm") != "SHUTDOWN":
+            return JSONResponse({"error": "send {\"confirm\": \"SHUTDOWN\"}"}, status_code=400)
+        return JSONResponse(await daemon.shutdown(dry_run=bool(body.get("dry_run"))))
+
+    @app.get("/api/bench/laser")
+    async def bench_laser(seconds: float = 10.0, distance_m: float | None = None):
+        """Collect `seconds` of laser readings now; compare with a tape-measured distance if given."""
+        import statistics as st
+        t0 = time.monotonic()
+        await asyncio.sleep(min(max(seconds, 1.0), 120.0))
+        rows = [r for t, r in list(daemon.laser_recent) if t >= t0]
+        vals = [r for r in rows if r is not None]
+        out = {"seconds": seconds, "readings": len(rows), "valid": len(vals), "no_return": len(rows) - len(vals),
+               "rate_hz": round(len(rows) / seconds, 2)}
+        if vals:
+            out.update(mean_m=round(st.fmean(vals), 4), median_m=round(st.median(vals), 4),
+                       std_m=round(st.pstdev(vals), 4), min_m=min(vals), max_m=max(vals))
+            if distance_m is not None:
+                out["distance_m"] = distance_m
+                out["bias_m"] = round(st.median(vals) - distance_m, 4)
+                out["verdict"] = ("ok" if abs(out["bias_m"]) <= 0.15 and out["std_m"] <= 0.10 else "check")
+        return JSONResponse(out)
+
+    @app.post("/api/bench/camera")
+    async def bench_camera(request: Request):
+        """Camera wiring test: ask the camera for one capture (HTTP) and time the exposure edge on the Pi GPIO.
+        Without Ethernet, press the camera's capture button during the 10 s listening window instead."""
+        cam = daemon.camera
+        if not cam.enabled:
+            return JSONResponse({"error": "no camera configured"}, status_code=400)
+        n0, t0 = cam.count, time.monotonic()
+        fired = None
+        if cam.status_url and not daemon.sim_mode:
+            base = cam.status_url.rsplit("/status", 1)[0]
+            try:
+                import httpx
+                async with httpx.AsyncClient(timeout=3.0) as client:
+                    r = await client.get(f"{base}/capture")
+                    fired = {"http_status": r.status_code}
+            except Exception as exc:
+                fired = {"error": str(exc)}
+        listen = 10.0 if fired is None else 3.0
+        first = None
+        while time.monotonic() - t0 < listen:
+            if cam.count > n0 and first is None:
+                first = time.monotonic()
+            await asyncio.sleep(0.005)
+        edges = cam.count - n0
+        out = {"edges_seen": edges, "listened_s": listen, "capture_request": fired, "pin": cam.pin}
+        if first is not None and fired is not None:
+            out["request_to_edge_ms"] = round((first - t0) * 1000, 1)
+        out["verdict"] = ("ok: the exposure signal reaches the Pi" if edges else
+                          "no edge: check the Top-of-Frame pin mode, the wire to GPIO "
+                          f"{cam.pin}, and the shared ground")
+        return JSONResponse(out)
 
     @app.get("/api/diagnose")
     async def get_diagnose():

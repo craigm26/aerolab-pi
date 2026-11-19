@@ -212,7 +212,8 @@ def build_config(base: dict, answers: dict, catalog: dict | None = None) -> dict
                              "exposure_gpio": int(answers.get("camera.pin", 27)),
                              "exposure_edge": "falling",
                              "expected_hz": float(answers.get("camera.hz", m.get("expected_hz", 1.0))),
-                             "status_url": answers.get("camera.status_url", m.get("status_url", ""))}
+                             "status_url": answers.get("camera.status_url", m.get("status_url", "")),
+                             "control_capture": bool(answers.get("camera.control", True))}
         else:
             cfg.pop("camera", None)
         if gpio:
@@ -565,6 +566,13 @@ def interview(ui, base: dict, catalog: dict | None = None) -> tuple[dict, dict]:
         a["camera.status_url"] = ui.text(
             "Camera status address (camera on Ethernet; leave empty if not connected):",
             cur.get("status_url", m.get("status_url", "")))
+        if a["camera.status_url"]:
+            a["camera.control"] = ui.yesno(
+                "Let START SURVEY / STOP SURVEY switch the camera's timer capture on and off over Ethernet?\n\n"
+                "The camera still stores every image itself. Say No to start and stop it on the camera.",
+                default_yes=bool(cur.get("control_capture", True)))
+        else:
+            a["camera.control"] = False
 
     # Timing
     if mode == "live" and ui.yesno(

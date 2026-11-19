@@ -60,6 +60,12 @@ else
   }
 fi
 
+# Safe shutdown from the cockpit display: allow exactly one privileged command, nothing else.
+echo "$RUN_USER ALL=(root) NOPASSWD: /usr/bin/systemctl poweroff" \
+  | sudo tee /etc/sudoers.d/aerolab-poweroff > /dev/null
+sudo chmod 440 /etc/sudoers.d/aerolab-poweroff
+sudo visudo -cf /etc/sudoers.d/aerolab-poweroff > /dev/null || sudo rm -f /etc/sudoers.d/aerolab-poweroff
+
 # USB-serial adapters: FTDI chips buffer up to 16 ms by default, which smears timestamps.
 # This rule sets 1 ms on every FTDI port as it appears. (CP210x/CH340/PL2303 have no such setting.)
 echo 'ACTION=="add", SUBSYSTEM=="usb-serial", DRIVERS=="ftdi_sio", ATTR{latency_timer}="1"' \
