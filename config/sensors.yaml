@@ -1,12 +1,14 @@
 # AeroLab-Pi hardware and flight configuration
 
+mode: "live"                # "live" or "sim"; ./configure.sh sets this
+
 server:
   host: "0.0.0.0"
   port: 8000
   hud_hz: 10
 
 gnss:
-  port: "/dev/ttyAMA0"      # Pi hardware UART, or /dev/ttyACM0 for a USB GNSS
+  port: "/dev/serial0"      # Pi GPIO UART (pins 8/10), or a USB GNSS such as /dev/ttyACM0
   baud: 9600
 
 laser_altimeter:

@@ -1,16 +1,20 @@
 #!/usr/bin/env bash
 # One-command Raspberry Pi installer: headless, starts on boot.
 #
-#   ./install.sh          real sensors
-#   ./install.sh --sim    simulated sensors (bench test the whole box with nothing wired)
+#   ./install.sh             asks setup questions with menus (ports, trigger, logging, hotspot)
+#   ./install.sh --defaults  no questions; uses config/sensors.yaml as is
+#   ./install.sh --sim       no questions; simulated sensors (bench test with nothing wired)
 #
-# Safe to run again after a `git pull`.
+# Safe to run again after a `git pull`. Change settings later with ./configure.sh.
 set -euo pipefail
 
-MODE_ARGS=""
-if [[ "${1:-}" == "--sim" ]]; then
-  MODE_ARGS="--sim"
-fi
+CONFIG_ARGS=""
+case "${1:-}" in
+  --sim) CONFIG_ARGS="--defaults --sim" ;;
+  --defaults) CONFIG_ARGS="--defaults" ;;
+  "") ;;
+  *) echo "Unknown option: $1 (use --defaults or --sim)"; exit 2 ;;
+esac
 
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUN_USER="${SUDO_USER:-$USER}"
@@ -39,6 +43,20 @@ if command -v raspi-config >/dev/null 2>&1; then
   fi
 fi
 
+# Setup questions. Without a terminal (e.g. piped install) fall back to defaults.
+if [[ -z "$CONFIG_ARGS" && ! -t 0 ]]; then
+  CONFIG_ARGS="--defaults"
+fi
+if [[ -n "$CONFIG_ARGS" && -f "$APP_DIR/config/sensors.local.yaml" && "${1:-}" != "--sim" ]]; then
+  echo "Keeping existing settings in config/sensors.local.yaml"
+else
+  # shellcheck disable=SC2086
+  "$APP_DIR/.venv/bin/python" "$APP_DIR/scripts/configure.py" $CONFIG_ARGS || {
+    echo "Setup cancelled. Run ./install.sh again, or ./install.sh --defaults."
+    exit 1
+  }
+fi
+
 sudo tee /etc/systemd/system/aerolab.service > /dev/null <<EOF
 [Unit]
 Description=AeroLab-Pi flight telemetry and cockpit HUD
@@ -49,7 +67,7 @@ Type=simple
 User=$RUN_USER
 WorkingDirectory=$APP_DIR
 Environment=PYTHONUNBUFFERED=1
-ExecStart=$APP_DIR/.venv/bin/python $APP_DIR/daemon/main.py --config $APP_DIR/config/sensors.yaml $MODE_ARGS
+ExecStart=$APP_DIR/.venv/bin/python $APP_DIR/daemon/main.py --config $APP_DIR/config/sensors.local.yaml
 Restart=always
 RestartSec=2
 
@@ -61,11 +79,13 @@ sudo systemctl daemon-reload
 sudo systemctl enable aerolab.service
 sudo systemctl restart aerolab.service
 
-PORT="$(grep -E '^\s*port:\s*[0-9]+' "$APP_DIR/config/sensors.yaml" | head -1 | awk '{print $2}')"
+PORT="$("$APP_DIR/.venv/bin/python" -c 'import yaml,sys;print(yaml.safe_load(open(sys.argv[1]))["server"]["port"])' "$APP_DIR/config/sensors.local.yaml")"
+MODE="$("$APP_DIR/.venv/bin/python" -c 'import yaml,sys;print(yaml.safe_load(open(sys.argv[1])).get("mode","live"))' "$APP_DIR/config/sensors.local.yaml")"
 echo ""
-echo "=== AeroLab-Pi installed ${MODE_ARGS:+(SIMULATION MODE)} ==="
+echo "=== AeroLab-Pi installed (mode: $MODE) ==="
 echo "Cockpit HUD: http://$(hostname -I | awk '{print $1}'):${PORT:-8000}"
 echo "Service log: journalctl -u aerolab -f"
+echo "Change settings: ./configure.sh"
 if [[ "$NEEDS_REBOOT" == "1" ]]; then
   echo ""
   echo "REBOOT NEEDED: the serial port settings changed (sudo reboot)."
@@ -73,5 +93,5 @@ fi
 echo ""
 echo "Before flight (see README):"
 echo "  1. Mount an external USB SSD at /mnt/ssd for flight logs."
-echo "  2. Turn on the Pi's Wi-Fi hotspot for the cockpit iPad."
+echo "  2. Turn on the Pi's Wi-Fi hotspot for the cockpit iPad (./configure.sh offers it)."
 echo "  3. Turn on the read-only overlay filesystem LAST, after everything works."

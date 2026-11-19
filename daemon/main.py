@@ -500,13 +500,18 @@ def create_app(daemon: AeroLabDaemon) -> FastAPI:
 
 
 def main():
+    local = APP_ROOT / "config" / "sensors.local.yaml"
+    default_cfg = local if local.exists() else APP_ROOT / "config" / "sensors.yaml"
     parser = argparse.ArgumentParser(description="AeroLab-Pi flight telemetry daemon")
-    parser.add_argument("--config", default=str(APP_ROOT / "config" / "sensors.yaml"))
+    parser.add_argument("--config", default=str(default_cfg),
+                        help="defaults to config/sensors.local.yaml (written by ./configure.sh) if present")
     parser.add_argument("--sim", action="store_true", help="run with simulated flight sensors")
     parser.add_argument("--port", type=int, help="override server.port from the config")
     args = parser.parse_args()
 
-    daemon = AeroLabDaemon.from_file(args.config, sim_mode=args.sim)
+    with open(args.config, "r") as f:
+        cfg = yaml.safe_load(f)
+    daemon = AeroLabDaemon(cfg, sim_mode=args.sim or cfg.get("mode") == "sim")
     app = create_app(daemon)
     uvicorn.run(app, host=daemon.cfg["server"]["host"],
                 port=args.port or int(daemon.cfg["server"]["port"]))
