@@ -148,6 +148,7 @@ def test_every_profile_builds_a_config_the_daemon_accepts(tmp_path):
         for mode in ("live", "sim"):
             cfg = configure.build_config(BASE, configure.profile_answers(prof, BASE, cat, mode), cat)
             cfg["logging"]["fallback_dir"] = str(tmp_path / prof["id"])
+            cfg["calibration_file"] = str(tmp_path / "cal.json")
             for sec in ("gnss", "laser_altimeter", "imu_ahrs"):
                 c = cfg[sec]
                 if main.section_enabled(cfg, sec):
@@ -161,6 +162,7 @@ def test_written_config_loads_in_daemon(tmp_path):
     import main
     cfg = configure.build_config(BASE, {"mode": "sim"})  # no device answers: base sections kept
     cfg["logging"]["fallback_dir"] = str(tmp_path)
+    cfg["calibration_file"] = str(tmp_path / "cal.json")
     out = tmp_path / "local.yaml"
     configure.write_config(cfg, out)
     loaded = yaml.safe_load(out.read_text())

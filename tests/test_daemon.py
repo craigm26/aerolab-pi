@@ -72,6 +72,7 @@ def test_log_dir_sim_never_touches_flight_logs(tmp_path):
 def _cfg(tmp_path):
     cfg = yaml.safe_load(CONFIG.read_text())
     cfg["logging"]["fallback_dir"] = str(tmp_path)
+    cfg["calibration_file"] = str(tmp_path / "cal.json")
     cfg["payload_sync"]["trigger_hz"] = 10.0
     cfg["logging"]["log_hz"] = 20
     return cfg

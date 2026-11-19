@@ -14,6 +14,7 @@ import csv
 import json
 import math
 import os
+import random
 import sqlite3
 import sys
 import time
@@ -29,7 +30,9 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import buddy as buddy_mod  # noqa: E402
+import calibration as calib  # noqa: E402
 import drivers  # noqa: E402
+import integrity as integ  # noqa: E402
 
 # gpiozero works on every Pi model including the Pi 5 (RPi.GPIO does not).
 # On a laptop it is missing or has no pin factory, and triggers are simulated.
@@ -41,17 +44,21 @@ except ImportError:
 
 APP_ROOT = Path(__file__).resolve().parent.parent
 HUD_PATH = APP_ROOT / "hud" / "index.html"
+DEFAULT_CAL_PATH = APP_ROOT / "config" / "calibration.local.json"
 STALE_AFTER_S = 2.0
 M_TO_FT = 3.28084
+BIT_DELAY_S = 8.0
 
 # Default driver per sensor section when the config does not name one.
 DEFAULT_DRIVER = {"gnss": "nmea", "laser_altimeter": "ascii_number", "imu_ahrs": "csv_rpy"}
+ROLE = {"gnss": "gnss", "laser_altimeter": "laser", "imu_ahrs": "imu"}
 
 
 @dataclass
 class TelemetryState:
     utc_iso: str = ""
     unix_ts: float = 0.0
+    flight_id: int = 0
     # GNSS
     lat: float = 0.0
     lon: float = 0.0
@@ -59,14 +66,20 @@ class TelemetryState:
     alt_ref: str = "MSL"          # "HAE" when the source reports height above the ellipsoid
     gps_fix: int = 0
     sats: int = 0                 # -1 when the source does not report a count
+    hdop: float = 0.0
+    gs_ms: float = 0.0
+    track_deg: float = 0.0
     gnss_ok: bool = False
     gnss_time_offset_s: float | None = None
     # Laser altimeter and fused AGL
-    laser_raw_m: float = 0.0
+    laser_raw_m: float = 0.0      # last reading as received
+    laser_used_m: float = 0.0     # after the spike filter and scale
     agl_m: float = 0.0
     agl_ft: float = 0.0
+    agl_quality: str = "ok"       # ok | tilt | range
+    off_nadir_deg: float = 0.0
     laser_ok: bool = False
-    # Attitude (AHRS/IMU or GNSS/INS)
+    # Attitude (AHRS/IMU or GNSS/INS), after calibration
     roll_deg: float = 0.0
     pitch_deg: float = 0.0
     yaw_deg: float = 0.0
@@ -78,6 +91,7 @@ class TelemetryState:
     log_file: str = ""
     log_dir: str = ""
     sim_mode: bool = False
+    calibrated: bool = False
     low_agl_warn_ft: float = 200.0
 
 
@@ -151,23 +165,55 @@ def now_utc() -> tuple[float, str]:
     return dt.timestamp(), dt.isoformat()
 
 
+def _add_columns(conn: sqlite3.Connection, table: str, cols: dict):
+    """Add columns to a table from an older version, keeping its data."""
+    have = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+    for name, typ in cols.items():
+        if name not in have:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {typ}")
+
+
 # ---------------------------------------------------------------------------
 # Daemon
 # ---------------------------------------------------------------------------
 
 class AeroLabDaemon:
-    def __init__(self, cfg: dict, sim_mode: bool = False):
+    def __init__(self, cfg: dict, sim_mode: bool = False, cal_path: Path | None = None):
         self.cfg = cfg
         self.sim_mode = sim_mode
-        self.state = TelemetryState(
-            sim_mode=sim_mode,
-            low_agl_warn_ft=float(cfg.get("hud", {}).get("low_agl_warn_ft", 200)),
-        )
+        hud = cfg.get("hud") or {}
+        self.state = TelemetryState(sim_mode=sim_mode, low_agl_warn_ft=float(hud.get("low_agl_warn_ft", 200)))
         self.last_seen = {"gnss": 0.0, "laser": 0.0, "imu": 0.0}
         self.clients: set[WebSocket] = set()
         self.tasks: list[asyncio.Task] = []
         self.trigger_pin = None
-        self.max_range_m = float((cfg.get("laser_altimeter") or {}).get("max_range_m", 0) or 0)
+        lc = cfg.get("laser_altimeter") or {}
+        self.max_range_m = float(lc.get("max_range_m", 0) or 0)
+        self.max_tilt_deg = float(hud.get("max_tilt_deg", 20.0))
+
+        # Calibration (config/calibration.local.json unless overridden)
+        self.cal_path = Path(cal_path or cfg.get("calibration_file") or DEFAULT_CAL_PATH)
+        if not self.cal_path.is_absolute():
+            self.cal_path = APP_ROOT / self.cal_path
+        self.cal = calib.Calibration.load(self.cal_path)
+        self.state.calibrated = bool(self.cal.updated)
+        self.capture: calib.GroundCapture | None = None
+        self.raw_roll = 0.0
+        self.raw_pitch = 0.0
+        self.fix_time = 0.0
+
+        # Integrity monitors
+        self.monitors = {
+            "gnss": integ.SensorMonitor((cfg.get("gnss") or {}).get("rate_hz")),
+            "laser": integ.SensorMonitor(lc.get("rate_hz")),
+            "imu": integ.SensorMonitor((cfg.get("imu_ahrs") or {}).get("rate_hz")),
+        }
+        self.laser_gate = integ.LaserGate(float(lc.get("spike_gate_m", 5.0)), float(lc.get("spike_gate_rel", 0.05)))
+        self.gnss_check = integ.GnssIntegrity()
+        self.heading_check = integ.HeadingCheck()
+        self.bit: dict = {"done": False, "status": "running", "items": []}
+        self._debounce: dict = {}
+        self.drivers: dict = {}
 
         log_cfg = cfg["logging"]
         self.log_dir = resolve_log_dir(log_cfg["primary_dir"], log_cfg["fallback_dir"], sim_mode)
@@ -190,11 +236,14 @@ class AeroLabDaemon:
                 used["imu"] = True
             self.buddy.configured = used
         self.ai_status: dict = {"available": False, "reason": "checking"}
+        self.new_flight("boot")
 
     @classmethod
     def from_file(cls, config_path: str, sim_mode: bool = False) -> "AeroLabDaemon":
         with open(config_path, "r") as f:
             return cls(yaml.safe_load(f), sim_mode=sim_mode)
+
+    # -- database -----------------------------------------------------------
 
     def _connect_db(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path)
@@ -219,6 +268,10 @@ class AeroLabDaemon:
             )
             """
         )
+        _add_columns(conn, "telemetry", {"flight_id": "INTEGER", "laser_used_m": "REAL", "agl_quality": "TEXT",
+                                         "hdop": "REAL", "gs_ms": "REAL", "track_deg": "REAL",
+                                         "raw_roll_deg": "REAL", "raw_pitch_deg": "REAL",
+                                         "fix_lat": "REAL", "fix_lon": "REAL", "gnss_age_ms": "REAL"})
         # trigger_id restarts at 1 every boot, so it is not the primary key;
         # session_start tells boots apart.
         conn.execute(
@@ -234,41 +287,114 @@ class AeroLabDaemon:
             )
             """
         )
+        # lat/lon are extrapolated to the trigger instant; the raw fix and the age
+        # of each sensor's last sample are kept so processing can redo it.
+        _add_columns(conn, "payload_triggers", {"flight_id": "INTEGER", "fix_lat": "REAL", "fix_lon": "REAL",
+                                                "gnss_age_ms": "REAL", "laser_age_ms": "REAL",
+                                                "imu_age_ms": "REAL", "gs_ms": "REAL", "track_deg": "REAL",
+                                                "agl_quality": "TEXT"})
         conn.execute("CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT, "
                      "unix_ts REAL, level TEXT, text TEXT)")
+        conn.execute("CREATE TABLE IF NOT EXISTS flights (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                     "started REAL, reason TEXT, profile TEXT, calibration TEXT, config TEXT, self_test TEXT)")
         conn.commit()
         conn.close()
         self.session_start = time.time()
 
-    def update_agl(self):
-        offset = float(self.cfg["laser_altimeter"]["mounting_offset_m"])
-        agl = compute_agl(self.state.laser_raw_m, self.state.roll_deg,
-                          self.state.pitch_deg, offset)
-        self.state.agl_m = round(agl, 2)
-        self.state.agl_ft = round(agl * M_TO_FT, 1)
+    def new_flight(self, reason: str = "new flight") -> int:
+        """Start a flight record: snapshots calibration and config so every flight is traceable."""
+        conn = self._connect_db()
+        cur = conn.execute(
+            "INSERT INTO flights (started, reason, profile, calibration, config, self_test) VALUES (?,?,?,?,?,?)",
+            (time.time(), reason, self.cfg.get("profile", ""), json.dumps(self.cal.summary()),
+             json.dumps(self.cfg, default=str), json.dumps(self.bit)))
+        conn.commit()
+        conn.close()
+        self.state.flight_id = cur.lastrowid
+        return cur.lastrowid
 
-    def apply(self, r: dict):
+    # -- measurement --------------------------------------------------------
+
+    def mounting_offset(self) -> float:
+        if self.cal.laser_offset_m is not None:
+            return float(self.cal.laser_offset_m)
+        return float(self.cfg["laser_altimeter"]["mounting_offset_m"])
+
+    def beam_attitude(self) -> tuple[float, float]:
+        """Laser beam roll/pitch: calibrated aircraft attitude plus the laser's boresight."""
+        return (self.state.roll_deg + self.cal.boresight_roll_deg,
+                self.state.pitch_deg + self.cal.boresight_pitch_deg)
+
+    def on_laser(self, rng: float):
+        """A new laser range: gate spikes, then compute AGL with the attitude at this moment.
+
+        AGL is only computed when a laser sample arrives, never by pairing a new
+        attitude with an old range: in a bank the slant range changes tens of
+        metres per second, and a stale range would be an error of metres.
+        """
+        s = self.state
+        roll, pitch = self.beam_attitude()
+        used = rng * self.cal.laser_scale
+        vertical = compute_agl(used, roll, pitch, self.mounting_offset())
+        if not self.laser_gate.accept(vertical):
+            return False
+        s.laser_used_m = round(used, 3)
+        s.agl_m = round(vertical, 2)
+        s.agl_ft = round(vertical * M_TO_FT, 1)
+        self.update_quality()
+        return True
+
+    def update_quality(self):
+        s = self.state
+        roll, pitch = self.beam_attitude()
+        s.off_nadir_deg = round(integ.off_nadir_deg(roll, pitch), 1)
+        s.agl_quality = integ.agl_quality(roll, pitch, s.laser_raw_m, self.max_range_m, self.max_tilt_deg)
+
+    def apply(self, r: dict, role: str | None = None):
         """Apply one driver reading to the state, whatever kinds it carries."""
         now = time.time()
         s = self.state
+        # Monitors follow what a reading carries: a GNSS/INS feeds both GNSS and attitude.
+        if "fix" in r or "lat" in r:
+            self.monitors["gnss"].on_reading(now)
+        if "roll" in r:
+            self.monitors["imu"].on_reading(now)
+        if "range_m" in r:
+            self.monitors["laser"].on_reading(now)
         if "fix" in r:
             s.gps_fix, s.sats = int(r["fix"]), int(r.get("sats", s.sats))
             if "gnss_tod" in r:
                 s.gnss_time_offset_s = round(tod_offset(r["gnss_tod"], now), 2)
+            if "hdop" in r:
+                s.hdop = round(float(r["hdop"]), 2)
             self.last_seen["gnss"] = now
+        if "gs_ms" in r:
+            s.gs_ms = round(float(r["gs_ms"]), 2)
+            if "track_deg" in r:
+                s.track_deg = round(float(r["track_deg"]), 1)
         if "lat" in r:
+            if self.gnss_check.check(now, r["lat"], r["lon"]):
+                self.buddy.emit("warn", f"GNSS position jumped {self.gnss_check.last_jump_m:,.0f} m")
             s.lat, s.lon = round(r["lat"], 7), round(r["lon"], 7)
+            self.fix_time = now
             if r.get("alt_msl") is not None:
                 s.alt_msl_m, s.alt_ref = round(float(r["alt_msl"]), 2), "MSL"
             elif r.get("alt_hae") is not None:
                 s.alt_msl_m, s.alt_ref = round(float(r["alt_hae"]), 2), "HAE"
             self.last_seen["gnss"] = now
+            if self.capture:
+                self.capture.add(lat=s.lat, lon=s.lon, alt=s.alt_msl_m, fix=s.gps_fix, sats=s.sats,
+                                 hdop=s.hdop or None, clock_offset=s.gnss_time_offset_s)
         if "roll" in r and "pitch" in r:
-            s.roll_deg, s.pitch_deg = round(r["roll"], 2), round(r["pitch"], 2)
+            self.raw_roll, self.raw_pitch = float(r["roll"]), float(r["pitch"])
+            roll, pitch = self.cal.correct_attitude(self.raw_roll, self.raw_pitch)
+            s.roll_deg, s.pitch_deg = round(roll, 2), round(pitch, 2)
             if "yaw" in r:
                 s.yaw_deg = round(r["yaw"] % 360.0, 2)
             self.last_seen["imu"] = now
-            self.update_agl()
+            if self.capture:
+                self.capture.add(roll_raw=self.raw_roll, pitch_raw=self.raw_pitch)
+            self.update_quality()
         elif "yaw" in r:
             s.yaw_deg = round(r["yaw"] % 360.0, 2)
         if "range_m" in r:
@@ -276,44 +402,77 @@ class AeroLabDaemon:
             if self.max_range_m and rng > self.max_range_m * 1.05:
                 return  # beyond the sensor's rated range: treat as no target
             s.laser_raw_m = round(rng, 3)
-            self.last_seen["laser"] = now
-            self.update_agl()
+            if self.capture:
+                self.capture.add(laser_raw=rng)
+            if self.on_laser(rng):
+                self.last_seen["laser"] = now
+
+    def extrapolated_position(self, now: float) -> tuple[float, float]:
+        """Where the aircraft is now, not where it was at the last fix: last fix + ground speed x age."""
+        s = self.state
+        age = now - self.fix_time if self.fix_time else 0.0
+        if 0 < age < 2.0 and s.gs_ms > 1.0:
+            return integ.project(s.lat, s.lon, s.track_deg, s.gs_ms * age)
+        return s.lat, s.lon
 
     # -- sensor loops -------------------------------------------------------
 
     async def sim_loop(self):
-        """Plausible flight telemetry for bench testing without hardware.
+        """Simulated sensors, fed through the same path as real ones.
 
-        With sim.faults: true, the laser drops out for 4 s every 45 s (as real
-        lasers do over open water or specular ice) so the callouts can be seen.
+        Flies around the planned survey height. Readings go through apply(), so
+        calibration, the spike filter and the integrity monitors all run. The
+        simulated installation has known errors (sim.imu_roll_bias_deg etc.) so
+        a ground calibration can be checked against the truth.
+
+        While a ground calibration is running the simulated aircraft is parked:
+        laser reads its true mounting height, attitude sits at the bias, GNSS
+        stays put with a little scatter.
+
+        With sim.faults: true, the laser drops out for 4 s every 45 s.
+        With sim.start_on_ground: true, the aircraft sits on the ramp from boot
+        until a ground calibration has been applied, then takes off: boot,
+        calibrate, fly, as on a real day.
         """
-        faults = bool((self.cfg.get("sim") or {}).get("faults", False))
-        # Fly around the planned survey height (if set) so the display looks like a real survey.
+        sc = self.cfg.get("sim") or {}
+        faults = bool(sc.get("faults", False))
+        rb, pb = float(sc.get("imu_roll_bias_deg", 0.8)), float(sc.get("imu_pitch_bias_deg", -0.5))
+        true_offset = float(sc.get("laser_offset_m", 0.62))
         survey_m = float((self.cfg.get("hud") or {}).get("survey_agl_ft", 0) or 0) / M_TO_FT
         center = survey_m if survey_m > 0 else 60.0
         swing = 0.4 * center
+        rnd = random.Random(7)
         t = 0.0
+        lat, lon = 38.5816, -121.4944
+        on_ground = bool(sc.get("start_on_ground", False))
         while True:
-            now = time.time()
-            s = self.state
-            s.lat = round(38.5816 + t * 0.0002, 7)
-            s.lon = round(-121.4944 + t * 0.0001, 7)
-
-            s.gps_fix = 1
-            s.sats = 11
-            s.gnss_time_offset_s = 0.0
-            s.roll_deg = round(12.0 * math.sin(t * 0.25), 1)
-            s.pitch_deg = round(3.5 * math.cos(t * 0.15), 1)
-            s.yaw_deg = round((90.0 + t * 1.5) % 360.0, 1)
-            s.laser_raw_m = round(center + swing * math.sin(t * 0.08), 2)
-            self.update_agl()
-            # MSL = height above ground + rolling terrain about 120 m above sea level.
-            s.alt_msl_m = round(s.agl_m + 120.0 + 30.0 * math.sin(t * 0.03), 1)
-            self.last_seen["gnss"] = now
-            self.last_seen["imu"] = now
-            if not (faults and 41.0 <= (t % 45.0)):
-                self.last_seen["laser"] = now
-            t += 0.1
+            if on_ground and self.state.calibrated:
+                on_ground = False
+            parked = on_ground or (self.capture is not None and not self.capture.done)
+            if parked:
+                self.apply({"fix": 1, "sats": 11, "hdop": 0.9, "gnss_tod": time.time() % 86400,
+                            "lat": lat + rnd.gauss(0, 4e-6), "lon": lon + rnd.gauss(0, 5e-6),
+                            "alt_msl": 120.0 + 1.5 + rnd.gauss(0, 0.4)}, "gnss")
+                self.apply({"gs_ms": 0.0, "track_deg": 0.0})
+                self.apply({"roll": rb + rnd.gauss(0, 0.05), "pitch": pb + rnd.gauss(0, 0.05),
+                            "yaw": 90.0}, "imu")
+                self.apply({"range_m": true_offset + rnd.gauss(0, 0.01)}, "laser")
+            else:
+                roll = float(sc.get("bank_deg", 12.0)) * math.sin(t * 0.25)
+                pitch = 3.5 * math.cos(t * 0.15)
+                yaw = (90.0 + t * 1.5) % 360.0
+                agl_true = center + swing * math.sin(t * 0.08)
+                gs = 55.0
+                lat, lon = integ.project(lat, lon, yaw, gs * 0.1)
+                self.apply({"fix": 1, "sats": 11, "hdop": 0.9, "gnss_tod": time.time() % 86400,
+                            "lat": lat, "lon": lon, "alt_msl": agl_true + 120.0 + 30.0 * math.sin(t * 0.03)},
+                           "gnss")
+                self.apply({"gs_ms": gs, "track_deg": yaw})
+                self.apply({"roll": roll + rb, "pitch": pitch + pb, "yaw": yaw}, "imu")
+                if not (faults and 41.0 <= (t % 45.0)):
+                    rng = (agl_true + true_offset) / (math.cos(math.radians(roll)) * math.cos(math.radians(pitch)))
+                    self.apply({"range_m": rng + rnd.gauss(0, 0.03)}, "laser")
+                t += 0.1
             await asyncio.sleep(0.1)
 
     async def _serial_chunks(self, name: str, port: str, baud: int, init: bytes = b"",
@@ -361,13 +520,19 @@ class AeroLabDaemon:
         if section == "laser_altimeter" and "unit" in c:
             opts.setdefault("unit", c["unit"])
         drv = drivers.make_driver(name, **opts)
+        self.drivers[section] = drv
+        role = ROLE[section]
+        mon = self.monitors[role]
         label = c.get("name") or section
         init = drivers.SERIAL_SCRIPTS.get(c.get("init_script", ""), b"") + _unescape(c.get("init", ""))
         poll = _unescape(c.get("poll", ""))
         async for data in self._serial_chunks(label, c["port"], int(c["baud"]), init=init, poll=poll,
                                               poll_hz=float(c.get("poll_hz", 0) or 0)):
             for reading in drv.feed(data):
-                self.apply(reading)
+                self.apply(reading, role)
+            st = getattr(drv, "stats", None)
+            if st is not None:
+                mon.on_counters(time.time(), st.good, st.bad)
 
     # -- payload trigger ----------------------------------------------------
 
@@ -381,7 +546,7 @@ class AeroLabDaemon:
             return None
 
     async def payload_sync_loop(self):
-        """Pulse the camera/radar trigger and log where the aircraft was."""
+        """Pulse the camera/radar trigger and log where the aircraft was at that instant."""
         c = self.cfg["payload_sync"]
         if not c.get("enabled", False):
             return
@@ -416,9 +581,11 @@ class AeroLabDaemon:
                     asyncio.create_task(_fire())
                 self.state.trigger_count += 1
                 s = self.state
-                snapshot = (self.session_start, s.trigger_count, ts, iso,
-                            s.lat, s.lon, s.alt_msl_m, s.agl_m,
-                            s.roll_deg, s.pitch_deg, s.yaw_deg)
+                lat, lon = self.extrapolated_position(ts)
+                ages = {k: (ts - v) * 1000 if v else None for k, v in self.last_seen.items()}
+                snapshot = (self.session_start, s.trigger_count, ts, iso, lat, lon, s.alt_msl_m, s.agl_m,
+                            s.roll_deg, s.pitch_deg, s.yaw_deg, s.flight_id, s.lat, s.lon,
+                            ages["gnss"], ages["laser"], ages["imu"], s.gs_ms, s.track_deg, s.agl_quality)
                 await asyncio.sleep(pulse_s)
                 if self.trigger_pin is not None:
                     self.trigger_pin.off()
@@ -427,8 +594,9 @@ class AeroLabDaemon:
                     """
                     INSERT INTO payload_triggers
                     (session_start, trigger_id, unix_ts, utc_iso, lat, lon, alt_msl_m,
-                     agl_m, roll_deg, pitch_deg, yaw_deg)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     agl_m, roll_deg, pitch_deg, yaw_deg, flight_id, fix_lat, fix_lon,
+                     gnss_age_ms, laser_age_ms, imu_age_ms, gs_ms, track_deg, agl_quality)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     snapshot,
                 )
@@ -484,17 +652,24 @@ class AeroLabDaemon:
                 os.fsync(csv_file.fileno())
 
                 s = self.state
+                # lat/lon: extrapolated to this instant; fix_lat/fix_lon: the last fix as received.
+                ext_lat, ext_lon = self.extrapolated_position(ts)
                 conn.execute(
                     """
                     INSERT INTO telemetry
                     (unix_ts, utc_iso, lat, lon, alt_msl_m, gps_fix, sats,
                      laser_raw_m, agl_m, agl_ft, roll_deg, pitch_deg, yaw_deg,
-                     gnss_ok, laser_ok, imu_ok, trigger_count)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     gnss_ok, laser_ok, imu_ok, trigger_count,
+                     flight_id, laser_used_m, agl_quality, hdop, gs_ms, track_deg, raw_roll_deg, raw_pitch_deg,
+                     fix_lat, fix_lon, gnss_age_ms)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (s.unix_ts, s.utc_iso, s.lat, s.lon, s.alt_msl_m, s.gps_fix, s.sats,
+                    (s.unix_ts, s.utc_iso, ext_lat, ext_lon, s.alt_msl_m, s.gps_fix, s.sats,
                      s.laser_raw_m, s.agl_m, s.agl_ft, s.roll_deg, s.pitch_deg, s.yaw_deg,
-                     int(s.gnss_ok), int(s.laser_ok), int(s.imu_ok), s.trigger_count),
+                     int(s.gnss_ok), int(s.laser_ok), int(s.imu_ok), s.trigger_count,
+                     s.flight_id, s.laser_used_m, s.agl_quality, s.hdop, s.gs_ms, s.track_deg,
+                     self.raw_roll, self.raw_pitch, s.lat, s.lon,
+                     (ts - self.fix_time) * 1000 if self.fix_time else None),
                 )
                 conn.commit()
                 self.state.logging_active = True
@@ -511,14 +686,138 @@ class AeroLabDaemon:
                 csv_file.close()
             conn.close()
 
+    # -- self-test and integrity --------------------------------------------
+
+    def enabled_sections(self) -> dict:
+        return {sec: (self.sim_mode or section_enabled(self.cfg, sec)) for sec in ROLE}
+
+    def plausibility(self, role: str) -> tuple[bool, str] | None:
+        s = self.state
+        if role == "laser":
+            if s.laser_raw_m <= 0:
+                return False, "range is 0"
+            if self.max_range_m and s.laser_raw_m > self.max_range_m:
+                return False, f"range {s.laser_raw_m:.1f} m beyond rating"
+            return True, ""
+        if role == "imu":
+            if abs(s.roll_deg) > 90 or abs(s.pitch_deg) > 90:
+                return False, f"attitude out of range (roll {s.roll_deg:.0f}°, pitch {s.pitch_deg:.0f}°)"
+            return True, ""
+        if role == "gnss":
+            if s.gps_fix and not (-90 <= s.lat <= 90 and -180 <= s.lon <= 180):
+                return False, "position out of range"
+            return True, ""
+        return None
+
+    async def run_bit(self, delay: float | None = None) -> dict:
+        """Boot self-test: config and storage at once, sensors after `delay` seconds of data."""
+        if delay is None:
+            delay = float((self.cfg.get("self_test") or {}).get("delay_s", BIT_DELAY_S))
+        self.bit = {"done": False, "status": "running", "items": [], "started": time.time()}
+        items = integ.config_checks(self.cfg, self.sim_mode, self.enabled_sections(), set(drivers.DRIVERS))
+        items.append(await asyncio.to_thread(integ.storage_test, self.log_dir))
+        self.bit["items"] = list(items)
+        await asyncio.sleep(delay)
+        now = time.time()
+        names = self.buddy.names()
+        conf = self.buddy.configured
+        for role in ("gnss", "laser", "imu"):
+            if conf.get(role):
+                items.append(integ.sensor_bit(names[role], self.monitors[role], now, self.plausibility(role)))
+        s = self.state
+        if s.gnss_time_offset_s is not None and s.gps_fix:
+            off = s.gnss_time_offset_s
+            items.append({"item": "Clock vs GNSS", "status": "ok" if abs(off) < 1 else "warn", "detail": f"{off:+.2f} s"})
+        ps = self.cfg.get("payload_sync") or {}
+        if ps.get("enabled"):
+            items.append({"item": "Payload trigger", "status": "ok" if s.trigger_count > 0 and (s.gpio_live or self.sim_mode) else "warn",
+                          "detail": f"{s.trigger_count} pulses" + ("" if s.gpio_live else " (no GPIO pin driven)")})
+        items.append({"item": "Calibration", "status": "ok" if self.cal.updated else "warn",
+                      "detail": f"ground calibration from {self.cal.updated}" if self.cal.updated
+                      else "not calibrated: run Calibrate in Buddy before the first flight"})
+        status = integ.overall(items)
+        self.bit = {"done": True, "status": status, "items": items, "finished": time.time()}
+        n_warn = sum(i["status"] == "warn" for i in items)
+        n_fail = sum(i["status"] == "fail" for i in items)
+        if status == "ok":
+            self.buddy.emit("info", "Self-test passed")
+        else:
+            self.buddy.emit("alert" if n_fail else "warn",
+                            f"Self-test: {n_fail} failed, {n_warn} warnings. See Ground check.")
+        conn = self._connect_db()
+        conn.execute("UPDATE flights SET self_test = ? WHERE id = ?", (json.dumps(self.bit), self.state.flight_id))
+        conn.commit()
+        conn.close()
+        return self.bit
+
+    def steady(self, key: str, cond: bool, now: float, hold_s: float = 3.0) -> bool:
+        """cond, but only after it has held for hold_s: stops a callout firing on every bank."""
+        state, since = self._debounce.get(key, (False, now))
+        if cond != state:
+            if key + ".pending" not in self._debounce or self._debounce[key + ".pending"][0] != cond:
+                self._debounce[key + ".pending"] = (cond, now)
+            if now - self._debounce[key + ".pending"][1] >= hold_s:
+                self._debounce[key] = (cond, now)
+                self._debounce.pop(key + ".pending", None)
+                return cond
+            return state
+        self._debounce.pop(key + ".pending", None)
+        return state
+
+    def integrity_tick(self, now: float):
+        """Edge-triggered integrity callouts, once a second."""
+        s, b = self.state, self.buddy
+        names = b.names()
+        if not self.bit.get("done"):
+            return  # let the self-test report first
+        for role in ("gnss", "laser", "imu"):
+            if not b.configured.get(role) or self.sim_mode:
+                continue
+            m = self.monitors[role]
+            snap = m.snapshot(now)
+            if m.expected_hz and snap["age_ms"] is not None and snap["age_ms"] < 2000:
+                b._edge(f"{role}.slow", snap["hz"] < 0.5 * m.expected_hz,
+                        ("warn", f"{names[role]} data rate low: {snap['hz']:g} Hz (expected {m.expected_hz:g})"),
+                        ("info", f"{names[role]} data rate normal"))
+            b._edge(f"{role}.errors", snap["err_pct"] > 5.0,
+                    ("warn", f"{names[role]}: {snap['err_pct']:.0f}% bad frames. Check baud and wiring."),
+                    ("info", f"{names[role]} frames clean again"))
+        if s.laser_ok and s.imu_ok:
+            b._edge("agl.tilt", self.steady("tilt", s.agl_quality == "tilt", now),
+                    ("warn", f"AGL less reliable: {s.off_nadir_deg:.0f}° off vertical"), ("info", "AGL reliable again"))
+            b._edge("agl.range", self.steady("range", s.agl_quality == "range", now),
+                    ("warn", "Laser near its maximum range"), ("info", "Laser back within range"))
+        if s.gnss_ok and s.gps_fix:
+            b._edge("gnss.hdop", self.steady("hdop", s.hdop > 4.0, now, 5.0), ("warn", f"Poor GNSS geometry: HDOP {s.hdop:.1f}"),
+                    ("info", "GNSS geometry good again"))
+            if s.imu_ok:
+                self.heading_check.add(now, s.yaw_deg, s.track_deg, s.gs_ms, s.roll_deg)
+                d = self.heading_check.diff(now)
+                b._edge("heading.track", d is not None and abs(d) > self.heading_check.max_diff,
+                        ("warn", f"Heading differs from GNSS track by {abs(d or 0):.0f}°: wind crab or heading error"),
+                        ("info", "Heading agrees with GNSS track"))
+
+    def health(self) -> dict:
+        now = time.time()
+        return {role: m.snapshot(now) for role, m in self.monitors.items()}
+
     async def buddy_loop(self):
         n = 0
         warmed = False
         while True:
+            now = time.time()
             if n % 10 == 0:
                 await self.buddy.refresh_slow(self.log_dir)
-            self.refresh_health(time.time())
+            self.refresh_health(now)
             self.buddy.evaluate(self.state, self.log_dir, self.fallback_logging)
+            self.integrity_tick(now)
+            if self.capture and not self.capture.done:
+                self.capture.add(trigger_count=self.state.trigger_count)
+                if self.capture.progress >= 1.0:
+                    res = self.capture.finish(self.cal, bool(self.cfg["payload_sync"].get("enabled")),
+                                              self.buddy.configured)
+                    self.buddy.emit("info" if res["status"] == "ok" else "warn",
+                                    f"Ground calibration finished: {res['status'].upper()}")
             if n % 30 == 0:  # re-check the local model every 30 s
                 self.ai_status = await self.buddy.ai_status()
                 if self.ai_status.get("available") and not warmed:
@@ -533,7 +832,17 @@ class AeroLabDaemon:
         d["_ai"] = self.ai_status
         d["_configured"] = self.buddy.configured
         d["_names"] = self.buddy.names()
+        d["_bit"] = self.bit
+        d["_health"] = self.health()
+        d["_cal"] = self.cal_status()
         return json.dumps(d)
+
+    def cal_status(self) -> dict:
+        out = {"calibration": self.cal.summary()}
+        if self.capture:
+            out["capture"] = {"progress": round(self.capture.progress, 3), "done": self.capture.done,
+                              "result": self.capture.result}
+        return out
 
     async def broadcast_loop(self):
         interval = 1.0 / float(self.cfg["server"]["hud_hz"])
@@ -556,7 +865,8 @@ class AeroLabDaemon:
         else:
             loops = [self.sensor_loop(sec) for sec in ("gnss", "laser_altimeter", "imu_ahrs")
                      if section_enabled(self.cfg, sec)]
-        loops += [self.payload_sync_loop(), self.logger_loop(), self.buddy_loop(), self.broadcast_loop()]
+        loops += [self.payload_sync_loop(), self.logger_loop(), self.buddy_loop(), self.broadcast_loop(),
+                  self.run_bit()]
         self.tasks = [asyncio.create_task(c) for c in loops]
 
     async def stop(self):
@@ -586,6 +896,67 @@ def create_app(daemon: AeroLabDaemon) -> FastAPI:
     async def get_state():
         daemon.refresh_health(time.time())
         return JSONResponse(json.loads(daemon.payload()))
+
+    @app.get("/api/bit")
+    async def get_bit():
+        return JSONResponse(daemon.bit)
+
+    @app.post("/api/bit/run")
+    async def run_bit():
+        return JSONResponse(await daemon.run_bit(delay=float(os.environ.get("AEROLAB_BIT_DELAY", 3.0))))
+
+    @app.get("/api/health")
+    async def get_health():
+        return JSONResponse(daemon.health())
+
+    @app.post("/api/flight/new")
+    async def flight_new():
+        fid = daemon.new_flight("new flight")
+        daemon.buddy.emit("info", f"New flight {fid} started")
+        asyncio.create_task(daemon.run_bit(delay=3.0))
+        return JSONResponse({"flight_id": fid})
+
+    @app.get("/api/cal")
+    async def cal_get():
+        return JSONResponse(daemon.cal_status())
+
+    @app.post("/api/cal/ground")
+    async def cal_ground(request: Request):
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        fe = body.get("field_elev_m")
+        daemon.capture = calib.GroundCapture(
+            seconds=float(body.get("seconds", 30)), ref_roll=float(body.get("ref_roll", 0) or 0),
+            ref_pitch=float(body.get("ref_pitch", 0) or 0),
+            field_elev_m=None if fe in (None, "") else float(fe),
+            antenna_height_m=float(body.get("antenna_height_m", 1.5) or 1.5))
+        daemon.buddy.emit("info", "Ground calibration started: keep the aircraft still")
+        return JSONResponse({"started": True, "seconds": daemon.capture.seconds})
+
+    @app.post("/api/cal/apply")
+    async def cal_apply():
+        cap = daemon.capture
+        if not cap or not cap.done:
+            return JSONResponse({"error": "no finished ground calibration"}, status_code=400)
+        if cap.result["status"] == "fail":
+            return JSONResponse({"error": "calibration failed; fix the failed items and run it again"},
+                                status_code=400)
+        calib.apply_proposed(daemon.cal, cap.result["proposed"], daemon.cal_path)
+        daemon.state.calibrated = True
+        daemon.laser_gate.reset()
+        daemon.buddy.emit("info", "Calibration saved and applied")
+        return JSONResponse(daemon.cal_status())
+
+    @app.post("/api/cal/reset")
+    async def cal_reset():
+        daemon.cal = calib.Calibration()
+        with contextlib.suppress(OSError):
+            daemon.cal_path.unlink()
+        daemon.state.calibrated = False
+        daemon.buddy.emit("warn", "Calibration cleared")
+        return JSONResponse(daemon.cal_status())
 
     @app.get("/api/buddy/check")
     async def buddy_check():
@@ -632,11 +1003,13 @@ def main():
                         help="defaults to config/sensors.local.yaml (written by ./configure.sh) if present")
     parser.add_argument("--sim", action="store_true", help="run with simulated flight sensors")
     parser.add_argument("--port", type=int, help="override server.port from the config")
+    parser.add_argument("--calibration", help="calibration file (default config/calibration.local.json)")
     args = parser.parse_args()
 
     with open(args.config, "r") as f:
         cfg = yaml.safe_load(f)
-    daemon = AeroLabDaemon(cfg, sim_mode=args.sim or cfg.get("mode") == "sim")
+    daemon = AeroLabDaemon(cfg, sim_mode=args.sim or cfg.get("mode") == "sim",
+                           cal_path=Path(args.calibration) if args.calibration else None)
     app = create_app(daemon)
     uvicorn.run(app, host=daemon.cfg["server"]["host"],
                 port=args.port or int(daemon.cfg["server"]["port"]))

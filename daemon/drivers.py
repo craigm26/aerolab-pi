@@ -32,6 +32,18 @@ def _finite(*vals) -> bool:
 # Line-based drivers
 # ---------------------------------------------------------------------------
 
+class BadFrame(Exception):
+    """A frame that was meant for this driver but failed its checksum or layout."""
+
+
+class Stats:
+    """Per-driver counters the integrity monitor reads: good readings and bad frames."""
+
+    def __init__(self):
+        self.good = 0
+        self.bad = 0
+
+
 class LineDriver:
     """Splits the byte stream into lines and parses each one."""
 
@@ -41,6 +53,7 @@ class LineDriver:
         self.buf = b""
         self.parse = parse
         self.opts = opts
+        self.stats = Stats()
 
     def feed(self, data: bytes) -> list[Reading]:
         self.buf += data
@@ -56,8 +69,13 @@ class LineDriver:
             text = line.decode("ascii", errors="ignore").strip()
             if not text:
                 continue
-            r = self.parse(text, **self.opts) if self.opts else self.parse(text)
+            try:
+                r = self.parse(text, **self.opts) if self.opts else self.parse(text)
+            except BadFrame:
+                self.stats.bad += 1
+                continue
             if r:
+                self.stats.good += 1
                 out.append(r)
         return out
 
@@ -81,9 +99,13 @@ def parse_nmea(text: str) -> Reading | None:
         return None
     if text[3:6] == "SHR" or text.startswith("$PASHR"):
         return parse_pashr(text)
+    if "*" in text and not _nmea_checksum_ok(text):
+        raise BadFrame("NMEA checksum")
     try:
         msg = pynmea2.parse(text, check=True)
-    except (pynmea2.ParseError, pynmea2.ChecksumError, AttributeError, ValueError):
+    except pynmea2.ChecksumError as exc:
+        raise BadFrame("NMEA checksum") from exc
+    except (pynmea2.ParseError, AttributeError, ValueError):
         return None
     st = getattr(msg, "sentence_type", "")
     if st == "GGA":
@@ -93,10 +115,32 @@ def parse_nmea(text: str) -> Reading | None:
             if msg.timestamp:
                 t = msg.timestamp
                 r["gnss_tod"] = t.hour * 3600 + t.minute * 60 + t.second + t.microsecond / 1e6
+            if msg.horizontal_dil:
+                r["hdop"] = float(msg.horizontal_dil)
             if fix > 0:
                 r.update(lat=float(msg.latitude), lon=float(msg.longitude), alt_msl=float(msg.altitude or 0.0))
             return r
         except (ValueError, TypeError):
+            return None
+    if st == "RMC":
+        try:
+            if msg.status != "A" or msg.spd_over_grnd in (None, ""):
+                return None
+            r = {"gs_ms": float(msg.spd_over_grnd) * 0.514444}
+            if msg.true_course not in (None, ""):
+                r["track_deg"] = float(msg.true_course) % 360.0
+            return r
+        except (ValueError, TypeError, AttributeError):
+            return None
+    if st == "VTG":
+        try:
+            if msg.spd_over_grnd_kmph in (None, ""):
+                return None
+            r = {"gs_ms": float(msg.spd_over_grnd_kmph) / 3.6}
+            if msg.true_track not in (None, ""):
+                r["track_deg"] = float(msg.true_track) % 360.0
+            return r
+        except (ValueError, TypeError, AttributeError):
             return None
     if st == "HDT":
         try:
@@ -109,7 +153,7 @@ def parse_nmea(text: str) -> Reading | None:
 def parse_pashr(text: str) -> Reading | None:
     """$PASHR,hhmmss.ss,heading,T,roll,pitch,heave,roll_acc,pitch_acc,heading_acc,gps_q,ins_q*cs"""
     if "*" in text and not _nmea_checksum_ok(text):
-        return None
+        raise BadFrame("PASHR checksum")
     f = text.split("*")[0].split(",")
     try:
         heading, roll, pitch = float(f[2]), float(f[4]), float(f[5])
@@ -179,9 +223,9 @@ def parse_vectornav(text: str) -> Reading | None:
     body, _, cs = text[1:].partition("*")
     try:
         if nmea_xor(body) != int(cs[:2], 16):
-            return None
-    except ValueError:
-        return None
+            raise BadFrame("VectorNav checksum")
+    except ValueError as exc:
+        raise BadFrame("VectorNav checksum") from exc
     f = body.split(",")
     try:
         if f[0] == "VNYMR":
@@ -197,6 +241,9 @@ def parse_vectornav(text: str) -> Reading | None:
             r["sats"] = -1               # not reported in $VNINS
             if r["fix"]:
                 r.update(lat=float(f[7]), lon=float(f[8]), alt_hae=float(f[9]))
+                vn, ve = float(f[10]), float(f[11])
+                r["gs_ms"] = math.hypot(vn, ve)
+                r["track_deg"] = math.degrees(math.atan2(ve, vn)) % 360.0
             return r
     except (IndexError, ValueError):
         return None
@@ -233,6 +280,7 @@ class BenewakeDriver:
     """
 
     def __init__(self, invalid_cm=(18000, 10000, 4500), **_):
+        self.stats = Stats()
         self.buf = bytearray()
         self.invalid = set(int(v) for v in invalid_cm)
 
@@ -245,12 +293,14 @@ class BenewakeDriver:
                 continue
             frame = self.buf[:9]
             if (sum(frame[:8]) & 0xFF) != frame[8]:
+                self.stats.bad += 1
                 del self.buf[0]
                 continue
             del self.buf[:9]
             dist = frame[2] | (frame[3] << 8)
             if dist == 0 or dist in self.invalid:
                 continue
+            self.stats.good += 1
             out.append({"range_m": dist / 100.0})
         if len(self.buf) > 256:
             del self.buf[:-9]
@@ -266,6 +316,7 @@ class BNO08xRVCDriver:
     """
 
     def __init__(self, **_):
+        self.stats = Stats()
         self.buf = bytearray()
 
     def feed(self, data: bytes) -> list[Reading]:
@@ -277,10 +328,12 @@ class BNO08xRVCDriver:
                 continue
             frame = bytes(self.buf[:19])
             if (sum(frame[2:18]) & 0xFF) != frame[18]:
+                self.stats.bad += 1
                 del self.buf[0]
                 continue
             del self.buf[:19]
             yaw, pitch, roll = struct.unpack_from("<hhh", frame, 3)
+            self.stats.good += 1
             out.append({"roll": roll / 100.0, "pitch": pitch / 100.0, "yaw": (yaw / 100.0) % 360.0})
         if len(self.buf) > 512:
             del self.buf[:-19]
@@ -315,6 +368,7 @@ class LightWareBinaryDriver:
     MSG_DISTANCE = 44
 
     def __init__(self, **_):
+        self.stats = Stats()
         self.buf = bytearray()
 
     def feed(self, data: bytes) -> list[Reading]:
@@ -334,12 +388,14 @@ class LightWareBinaryDriver:
                 break
             pkt = bytes(self.buf[:total])
             if struct.unpack_from("<H", pkt, total - 2)[0] != crc16_xmodem(pkt[:-2]):
+                self.stats.bad += 1
                 del self.buf[0]
                 continue
             del self.buf[:total]
             if pkt[3] == self.MSG_DISTANCE and plen >= 4:
                 d = struct.unpack_from("<I", pkt, 4)[0]
                 if d > 0:
+                    self.stats.good += 1
                     out.append({"range_m": d / 10.0})
         if len(self.buf) > 4096:
             self.buf.clear()
@@ -370,6 +426,7 @@ class MAVLinkDriver:
             raise RuntimeError("MAVLink driver needs pymavlink: .venv/bin/pip install pymavlink") from exc
         self.mav = mavlink2.MAVLink(None)
         self.mav.robust_parsing = True
+        self.stats = Stats()
 
     def feed(self, data: bytes) -> list[Reading]:
         out = []
@@ -379,7 +436,11 @@ class MAVLinkDriver:
             return out
         for m in msgs:
             t = m.get_type()
+            if t == "BAD_DATA":
+                self.stats.bad += 1
+                continue
             if t == "ATTITUDE":
+                self.stats.good += 1
                 out.append({"roll": math.degrees(m.roll), "pitch": math.degrees(m.pitch),
                             "yaw": math.degrees(m.yaw) % 360.0})
             elif t == "GPS_RAW_INT":
@@ -387,6 +448,13 @@ class MAVLinkDriver:
                 r: Reading = {"fix": fix, "sats": int(m.satellites_visible) if m.satellites_visible != 255 else -1}
                 if fix:
                     r.update(lat=m.lat / 1e7, lon=m.lon / 1e7, alt_msl=m.alt / 1000.0)
+                if m.eph != 65535:
+                    r["hdop"] = m.eph / 100.0
+                if m.vel != 65535:
+                    r["gs_ms"] = m.vel / 100.0
+                if m.cog != 65535:
+                    r["track_deg"] = (m.cog / 100.0) % 360.0
+                self.stats.good += 1
                 out.append(r)
         return out
 
@@ -422,9 +490,31 @@ DRIVERS: dict[str, dict] = {
                 "about": "MAVLink ATTITUDE + GPS_RAW_INT (needs pymavlink)"},
 }
 
+def ubx_packet(cls: int, msg_id: int, payload: bytes) -> bytes:
+    """u-blox UBX frame: B5 62 class id len(u16 LE) payload ck_a ck_b (8-bit Fletcher over class..payload)."""
+    body = bytes([cls, msg_id]) + struct.pack("<H", len(payload)) + payload
+    a = b = 0
+    for x in body:
+        a = (a + x) & 0xFF
+        b = (b + a) & 0xFF
+    return b"\xb5\x62" + body + bytes([a, b])
+
+
+def ubx_rate_gen9(ms: int) -> bytes:
+    """UBX-CFG-VALSET (0x06 0x8A), RAM layer: CFG-RATE-MEAS (key 0x30210001, U2 ms). F9P, M9N."""
+    return ubx_packet(0x06, 0x8A, bytes([0x00, 0x01, 0x00, 0x00]) + struct.pack("<IH", 0x30210001, ms))
+
+
+def ubx_rate_legacy(ms: int) -> bytes:
+    """UBX-CFG-RATE (0x06 0x08): measRate ms, navRate 1, timeRef GPS. M8 and older."""
+    return ubx_packet(0x06, 0x08, struct.pack("<HHH", ms, 1, 1))
+
+
 # Bytes some devices need on open (init) or repeatedly (poll), by name, for the config.
 SERIAL_SCRIPTS = {
     "lightware_grf_stream": LIGHTWARE_GRF_INIT,
+    "ublox9_5hz": ubx_rate_gen9(200),
+    "ublox8_5hz": ubx_rate_legacy(200),
 }
 
 

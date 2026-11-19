@@ -52,7 +52,7 @@ FT_PER_M = 3.28084
 # Device fields copied into a sensor section. Anything else in the section
 # (port, mounting offset) is the user's and survives a device change.
 DEVICE_FIELDS = ("name", "driver", "baud", "unit", "max_range_m", "driver_options", "init", "init_script",
-                 "poll", "poll_hz")
+                 "poll", "poll_hz", "rate_hz")
 
 
 # ---------------------------------------------------------------------------

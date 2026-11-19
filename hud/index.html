@@ -57,6 +57,9 @@
     .agl-unit { font-size: 1.2rem; color: var(--muted); letter-spacing: 2px; }
     .agl-sub { font-size: 1.2rem; color: var(--muted); margin-top: 8px; text-align: center; }
     .agl-low { color: var(--warn) !important; }
+    .agl-badges { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; min-height: 26px; margin-top: 8px; }
+    .badge2 { border: 1px solid var(--warn); color: var(--warn); border-radius: 6px; padding: 3px 8px; font-size: 0.8rem; font-weight: 800; letter-spacing: 1px; }
+    .badge2.dim { border-color: var(--border); color: var(--muted); }
     .agl-stale { color: var(--err) !important; }
 
     .horizon-box { width: 160px; height: 160px; border-radius: 50%; border: 3px solid var(--border); position: relative; overflow: hidden; background: var(--sky); margin-bottom: 12px; }
@@ -90,7 +93,7 @@
     .b-sub { color: var(--muted); font-size: 0.75rem; }
     .b-close { background: none; border: 1px solid var(--border); border-radius: 6px; padding: 6px 10px; }
     .tabs { display: flex; gap: 6px; }
-    .tab { flex: 1; background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 8px 4px; font-size: 0.8rem; font-weight: 700; color: var(--muted); }
+    .tab { flex: 1; background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 8px 2px; font-size: 0.72rem; font-weight: 700; color: var(--muted); }
     .tab.on { color: var(--accent); border-color: var(--accent); }
     .pane { display: none; flex: 1; min-height: 0; overflow-y: auto; flex-direction: column; gap: 8px; }
     .pane.on { display: flex; }
@@ -115,6 +118,19 @@
     .ask input { flex: 1; min-width: 0; background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 10px; font: inherit; font-size: 16px; }
     .ask button { background: var(--accent); color: #000; border: none; border-radius: 6px; padding: 0 14px; font-weight: 900; }
     .note { color: var(--muted); font-size: 0.72rem; line-height: 1.4; }
+    .sect { color: var(--accent); font-size: 0.75rem; letter-spacing: 2px; font-weight: 800; margin-top: 6px; }
+    .htab { width: 100%; border-collapse: collapse; font-size: 0.8rem; }
+    .htab td, .htab th { padding: 6px 4px; border-bottom: 1px solid var(--border); text-align: left; }
+    .htab th { color: var(--muted); font-weight: 600; font-size: 0.7rem; }
+    .form { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    .form label { display: flex; flex-direction: column; gap: 4px; font-size: 0.72rem; color: var(--muted); }
+    .form input { background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 8px; font: inherit; font-size: 16px; }
+    .bar { height: 10px; background: var(--panel); border: 1px solid var(--border); border-radius: 5px; overflow: hidden; }
+    .bar > div { height: 100%; width: 0; background: var(--accent); transition: width 300ms linear; }
+    .big { background: var(--accent); color: #000; border: none; border-radius: 6px; padding: 10px; font-weight: 900; letter-spacing: 1px; }
+    .big:disabled { background: var(--border); color: var(--muted); }
+    .cmp { display: grid; grid-template-columns: 1.4fr 1fr 1fr; gap: 4px 8px; font-size: 0.8rem; }
+    .cmp .h { color: var(--muted); font-size: 0.7rem; }
 
     /* ---- boot sequence ---- */
     #boot { position: fixed; inset: 0; z-index: 100; background: radial-gradient(ellipse at 50% 40%, #07141f 0%, #000 70%); display: flex; flex-direction: column;
@@ -208,6 +224,7 @@
       <div id="agl-ft" class="agl-value">---</div>
       <div class="agl-unit">FEET</div>
       <div class="agl-sub"><span id="agl-m">--.-</span> m &nbsp;|&nbsp; RAW: <span id="raw-m">--.-</span> m</div>
+      <div class="agl-badges" id="agl-badges"></div>
     </div>
 
     <div class="card">
@@ -241,7 +258,8 @@
     </div>
     <div class="tabs">
       <button class="tab on" data-pane="pane-callouts">CALLOUTS</button>
-      <button class="tab" data-pane="pane-check">GROUND CHECK</button>
+      <button class="tab" data-pane="pane-check">CHECKS</button>
+      <button class="tab" data-pane="pane-cal">CALIBRATE</button>
       <button class="tab" data-pane="pane-ask">ASK</button>
     </div>
 
@@ -258,6 +276,31 @@
       <button class="toggle" id="run-check">RUN GROUND CHECK</button>
       <div class="note">Run on the ramp before engine start. Uses the live data: the laser should read about 0 m AGL on the ground, which confirms the mounting offset.</div>
       <div id="checklist" style="display:flex;flex-direction:column;gap:6px"></div>
+      <div class="sect">SELF-TEST AT BOOT</div>
+      <div id="bitlist" style="display:flex;flex-direction:column;gap:6px"></div>
+      <div class="sect">SENSOR DATA, LIVE</div>
+      <table class="htab"><thead><tr><th>SENSOR</th><th>RATE</th><th>BAD FRAMES</th><th>LAST</th></tr></thead><tbody id="healthrows"></tbody></table>
+    </div>
+
+    <div class="pane" id="pane-cal">
+      <div class="note">Ground calibration: aircraft parked on firm ground, engine off, nobody moving, 30 seconds. It measures the laser's real mounting height (true AGL is 0 on the ground), the attitude sensor's mounting tilt, laser noise and GNSS scatter, and grades each against limits.</div>
+      <div class="form">
+        <label>Reference roll ° (inclinometer)<input id="c-roll" inputmode="decimal" value="0" /></label>
+        <label>Reference pitch ° (inclinometer)<input id="c-pitch" inputmode="decimal" value="0" /></label>
+        <label>Field elevation m (optional)<input id="c-elev" inputmode="decimal" placeholder="e.g. 7" /></label>
+        <label>Seconds<input id="c-sec" inputmode="numeric" value="30" /></label>
+      </div>
+      <button class="big" id="c-start">START GROUND CALIBRATION</button>
+      <div class="bar"><div id="c-bar"></div></div>
+      <div id="c-status" class="note"></div>
+      <div id="c-results" style="display:flex;flex-direction:column;gap:6px"></div>
+      <div id="c-cmp" class="cmp"></div>
+      <button class="big" id="c-apply" disabled>APPLY CALIBRATION</button>
+      <div class="sect">CURRENT CALIBRATION</div>
+      <div id="c-current" class="cmp"></div>
+      <div class="sect">FLIGHT</div>
+      <div class="row"><button class="toggle" id="newflight">START NEW FLIGHT</button><span class="note" id="flightinfo"></span></div>
+      <div class="note">A new flight gets its own record with the calibration and settings snapshotted, and reruns the self-test. Laser boresight is fitted after a flight with banks over flat ground: python tools/boresight.py.</div>
     </div>
 
     <div class="pane" id="pane-ask">
@@ -293,7 +336,7 @@
       done: false,
       rows: [
         ["LINK", "link"], ["GNSS", "gnss"], ["LASER", "laser"], ["ATTITUDE", "imu"],
-        ["LOGGER", "log"], ["TRIGGER", "trig"], ["BUDDY", "buddy"],
+        ["LOGGER", "log"], ["TRIGGER", "trig"], ["CALIBRATION", "cal"], ["BUDDY", "buddy"], ["SELF-TEST", "bit"],
       ],
       init() {
         const word = "AEROLAB-PI";
@@ -310,7 +353,7 @@
           `<div class="st" id="st-${key}"><span class="k">${label}</span><span class="dots"></span><span class="v">CHECKING</span></div>`).join("");
         this.rows.forEach(([, key], i) => setTimeout(() => $("st-" + key).classList.add("in"), 1250 + i * 110));
         $("boot").addEventListener("click", () => this.finish(true));
-        setTimeout(() => this.finish(false), 7000);   // never hold the display hostage
+        setTimeout(() => this.finish(false), 13000);  // never hold the display hostage
         this.spin();
       },
       spin() {
@@ -354,10 +397,29 @@
         step(5, () => d.trigger_count > 0 ? this.set("trig", d.gpio_live ? "ok" : "warn", d.gpio_live ? "PULSING" : "NO GPIO")
           : this.set("trig", "off", "OFF"));
         step(6, () => {
+          const c = (d._cal || {}).calibration || {};
+          c.calibrated ? this.set("cal", "ok", `OFFSET ${Number(c.laser_offset_m).toFixed(2)} M · ${String(c.updated).slice(0, 10)}`)
+                       : this.set("cal", "warn", "NOT CALIBRATED");
+        });
+        step(7, () => {
           const ai = d._ai || {};
           this.set("buddy", "ok", ai.available ? `AI · ${String(ai.model).toUpperCase()}` : "CALLOUTS ON");
         });
-        step(7.5, () => this.finishSoon());
+        step(8, () => this.waitBit());
+      },
+      waitBit() {
+        // The self-test needs a few seconds of sensor data; show its real result.
+        const tick = () => {
+          if (this.done) return;
+          const b = (last && last._bit) || {};
+          if (b.done) {
+            const nf = b.items.filter((i) => i.status === "fail").length, nw = b.items.filter((i) => i.status === "warn").length;
+            this.set("bit", b.status === "ok" ? "ok" : (nf ? "err" : "warn"),
+                     b.status === "ok" ? `PASS · ${b.items.length} CHECKS` : `${nf} FAIL · ${nw} WARN`);
+            this.finishSoon();
+          } else setTimeout(tick, 300);
+        };
+        tick();
       },
       waitOr(key, cls, text) {
         // Give a slow sensor a moment before calling it missing.
@@ -372,11 +434,12 @@
             v.dataset.final = 1; v.className = "v err"; v.textContent = "NO DATA"; });
           const anyErr = document.querySelector("#selftest .v.err");
           const r = $("ready");
-          r.textContent = anyErr ? "CHECK SENSORS" : "READY";
+          const anyWarn = document.querySelector("#selftest .v.warn");
+          r.textContent = anyErr ? "CHECK SENSORS" : (anyWarn ? "READY · SEE CHECKS" : "READY");
           r.style.color = anyErr ? "var(--warn)" : "var(--ok)";
           r.classList.add("in");
           setTimeout(() => this.finish(false), 900);
-        }, 1400);
+        }, 600);
       },
       finish(skipped) {
         if (this.done) return;
@@ -429,6 +492,14 @@
       $("logfile").textContent = `LOG: ${d.log_file || "---"}`;
       $("utc").textContent = `UTC: ${d.utc_iso ? d.utc_iso.slice(11, 19) : "--:--:--"}`;
 
+      const badges = [];
+      if (d.laser_ok && d.agl_quality === "tilt") badges.push(`<span class="badge2">TILT ${Math.round(d.off_nadir_deg)}° · LESS RELIABLE</span>`);
+      if (d.laser_ok && d.agl_quality === "range") badges.push(`<span class="badge2">NEAR LASER MAX RANGE</span>`);
+      if (!d.calibrated) badges.push(`<span class="badge2 dim">UNCALIBRATED</span>`);
+      $("agl-badges").innerHTML = badges.join("");
+      renderHealth(d);
+      renderCal(d);
+      $("flightinfo").textContent = `Flight ${d.flight_id}`;
       const ai = d._ai || {};
       $("b-ai").textContent = ai.available ? `Local AI: ${ai.model}` : `Rules only (${ai.reason || "no AI model"})`;
       handleEvents(d._events || []);
@@ -484,6 +555,61 @@
       document.querySelectorAll(".pane").forEach((p) => p.classList.toggle("on", p.id === tab.dataset.pane));
       if (tab.dataset.pane === "pane-check") runCheck();
     });
+
+    function renderHealth(d) {
+      const h = d._health || {}, n = d._names || {}, c = d._configured || {};
+      $("healthrows").innerHTML = ["gnss", "laser", "imu"].filter((k) => c[k]).map((k) => {
+        const x = h[k] || {};
+        const low = x.expected_hz && x.hz < 0.5 * x.expected_hz, bad = x.err_pct > 1;
+        return `<tr><td>${esc(n[k] || k)}</td><td style="color:${low ? "var(--warn)" : "inherit"}">${x.hz ?? "-"} Hz${x.expected_hz ? ` / ${x.expected_hz}` : ""}</td>` +
+               `<td style="color:${bad ? "var(--warn)" : "inherit"}">${x.err_pct ?? 0}%</td><td>${x.age_ms == null ? "never" : x.age_ms + " ms"}</td></tr>`;
+      }).join("");
+      const b = d._bit || {};
+      $("bitlist").innerHTML = b.done ? b.items.map((i) =>
+        `<div class="chk ${i.status}"><b>${i.status.toUpperCase()}</b><span>${esc(i.item)}</span><span class="d">${esc(i.detail)}</span></div>`).join("")
+        : `<div class="note">Running (needs a few seconds of sensor data)...</div>`;
+    }
+
+    let capWasDone = false;
+    function renderCal(d) {
+      const cs = d._cal || {}, cur = cs.calibration || {}, cap = cs.capture;
+      const fmt = (v, u) => v == null ? "not set" : `${Number(v).toFixed(3)}${u}`;
+      $("c-current").innerHTML = `<span class="h">VALUE</span><span class="h">NOW</span><span class="h"></span>` +
+        `<span>Laser offset</span><span>${fmt(cur.laser_offset_m, " m")}</span><span></span>` +
+        `<span>IMU roll bias</span><span>${fmt(cur.imu_roll_bias_deg, "°")}</span><span></span>` +
+        `<span>IMU pitch bias</span><span>${fmt(cur.imu_pitch_bias_deg, "°")}</span><span></span>` +
+        `<span>Boresight roll</span><span>${fmt(cur.boresight_roll_deg, "°")}</span><span></span>` +
+        `<span>Updated</span><span>${cur.updated || "never"}</span><span></span>`;
+      if (!cap) return;
+      $("c-bar").style.width = `${Math.round(cap.progress * 100)}%`;
+      if (!cap.done) { $("c-status").textContent = `Capturing... keep still (${Math.round(cap.progress * 100)}%)`; $("c-apply").disabled = true; return; }
+      if (capWasDone) return;
+      capWasDone = true;
+      const r = cap.result;
+      $("c-status").textContent = `Result: ${r.status.toUpperCase()}`;
+      $("c-results").innerHTML = r.items.map((i) =>
+        `<div class="chk ${i.status}"><b>${i.status.toUpperCase()}</b><span>${esc(i.item)}</span><span class="d">${esc(i.detail)}</span></div>`).join("");
+      const p = r.proposed, rows = [["laser_offset_m", "Laser offset", " m"], ["imu_roll_bias_deg", "IMU roll bias", "°"], ["imu_pitch_bias_deg", "IMU pitch bias", "°"]];
+      $("c-cmp").innerHTML = `<span class="h">VALUE</span><span class="h">NOW</span><span class="h">MEASURED</span>` +
+        rows.filter(([k]) => k in p).map(([k, l, u]) => `<span>${l}</span><span>${fmt(cur[k], u)}</span><span style="color:var(--ok)">${fmt(p[k], u)}</span>`).join("");
+      $("c-apply").disabled = r.status === "fail";
+    }
+    $("c-start").onclick = async () => {
+      capWasDone = false;
+      $("c-results").innerHTML = ""; $("c-cmp").innerHTML = "";
+      const num = (id) => { const v = $(id).value.trim(); return v === "" ? null : Number(v); };
+      await fetch("/api/cal/ground", { method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ seconds: num("c-sec") || 30, ref_roll: num("c-roll") || 0, ref_pitch: num("c-pitch") || 0, field_elev_m: num("c-elev") }) });
+    };
+    $("c-apply").onclick = async () => {
+      const r = await fetch("/api/cal/apply", { method: "POST" });
+      $("c-status").textContent = r.ok ? "Calibration saved and applied." : "Could not apply: " + (await r.json()).error;
+      $("c-apply").disabled = true;
+    };
+    $("newflight").onclick = async () => {
+      const r = await (await fetch("/api/flight/new", { method: "POST" })).json();
+      $("flightinfo").textContent = `Flight ${r.flight_id} started; self-test rerunning`;
+    };
 
     async function runCheck() {
       const box = $("checklist");

@@ -4,3 +4,4 @@ __pycache__/
 logs/
 .pytest_cache/
 config/sensors.local.yaml
+config/calibration.local.json

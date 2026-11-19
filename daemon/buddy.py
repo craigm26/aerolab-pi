@@ -199,6 +199,8 @@ class Buddy:
         if configured.get("imu", True):
             if not s.imu_ok:
                 add(names["imu"], "fail", "no data")
+            elif getattr(s, "gs_ms", 0) > 10 or s.agl_m > 10:
+                add(names["imu"], "ok", f"roll {s.roll_deg:.1f}°, pitch {s.pitch_deg:.1f}° (airborne: the level check is for the ramp)")
             elif abs(s.roll_deg) > 5:
                 add(names["imu"], "warn", f"roll {s.roll_deg:.1f}°: expected near 0 on the ramp")
             else:
