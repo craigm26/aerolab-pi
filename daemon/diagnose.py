@@ -101,6 +101,14 @@ def findings(d, catalog: dict | None = None) -> list[dict]:
                                         "At low baud rates the link itself can be the limit."])
 
     # ---- laser specifics
+    if conf.get("laser") and getattr(s, "laser_alive", False) and s.laser_no_return_pct > 20:
+        dev = _dev(cfg, "laser_altimeter", catalog)
+        add("warn" if s.laser_ok else "blocker",
+            f"Laser getting no ground return {s.laser_no_return_pct:.0f}% of the time",
+            "the laser is talking (cable and power are fine) but reports no target",
+            _ts(dev, "range") + _ts(dev, "spikes") +
+            ["On the ramp: check nothing blocks the beam and the laser points straight down.",
+             "In flight: usually height beyond the laser's range, a dark or wet surface, or cloud below."])
     if conf.get("laser") and s.laser_ok:
         dev = _dev(cfg, "laser_altimeter", catalog)
         gate = d.laser_gate
@@ -135,6 +143,34 @@ def findings(d, catalog: dict | None = None) -> list[dict]:
             ["Every reading is also stamped with the monotonic clock and GNSS epoch time, so "
              "tools/export_laser.py still puts it on GNSS time. Nothing is lost.",
              "To fix the clock itself: connect to the internet once, or fit the Pi 5 RTC battery."])
+
+    # ---- camera that captures on its own
+    cam = getattr(d, "camera", None)
+    if cam is not None and cam.enabled:
+        c = cam.snapshot()
+        if not c["gpio_ok"]:
+            add("warn", f"{c['name']}: exposure input unavailable", c["gpio_error"] or f"GPIO {c['pin']}",
+                ["Check no other program uses that GPIO and the user is in the gpio group (reboot after install)."])
+        elif not c["exposures"] or c["stopped"]:
+            add("warn", f"{c['name']}: no exposures " + ("seen" if not c["exposures"] else f"for {c['age_s']:.0f} s"),
+                f"watching GPIO {c['pin']} (falling edge)",
+                ["Check the camera is powered and its auto-capture is on: web page → Settings → Auto capture mode "
+                 "'timer', with the period you want.",
+                 "Check a camera pin is set to Top of Frame Output and wired to the Reach time mark AND to Pi "
+                 f"GPIO {c['pin']}, grounds joined.",
+                 "Images are still being stored by the camera if it is capturing; this only means the Pi can't see "
+                 "the exposures."])
+        if c["status_url"] and not c["status_ok"] and c["status_age_s"] is None:
+            add("info", f"{c['name']}: status not reachable", c["status_url"],
+                ["Connect the camera's Ethernet to the Pi; give the Pi's Ethernet a static address on 192.168.1.x "
+                 "(the camera is 192.168.1.83).", "Optional: exposures are monitored without it."])
+        st = c["status"]
+        if c["status_ok"] and st.get("auto_cap_active") is False:
+            add("warn", f"{c['name']}: auto-capture is off", "camera /status says auto_cap_active false",
+                ["Turn on auto capture (timer) in the camera's web page, or the camera will not take pictures."])
+        if c["status_ok"] and isinstance(st.get("sd_gb_free"), (int, float)) and st["sd_gb_free"] < 5:
+            add("warn", f"{c['name']}: SD card low", f"{st['sd_gb_free']} GB free",
+                ["Swap or empty the camera's card before the next flight."])
 
     # ---- timing (PPS)
     pps = getattr(d, "pps", None)

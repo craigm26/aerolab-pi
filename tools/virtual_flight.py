@@ -94,7 +94,7 @@ def run_profile(profile_id: str, flight_s: float = 35.0, verbose: bool = True,
     survey_m = float(prof.get("survey_agl_ft", 1000)) / 3.28084
     rng = float(cfg["laser_altimeter"].get("max_range_m") or 0)
     if rng:
-        survey_m = min(survey_m, 0.8 * rng)          # fly where the laser can see the ground
+        survey_m = min(survey_m, 0.92 * rng)         # fly where the laser can see the ground
     # Without an attitude sensor the survey legs are straight (attitude is applied in post-processing).
     traj = sim.Trajectory(survey_agl_m=survey_m, bank_deg=20.0 if has_att else 3.0)
     work = Path(tempfile.mkdtemp(prefix=f"aerolab-vf-{profile_id}-"))
@@ -106,7 +106,8 @@ def run_profile(profile_id: str, flight_s: float = 35.0, verbose: bool = True,
         c = cfg[sec]
         rate = c.get("rate_hz") or DEFAULT_RATE.get(c["driver"], 10)
         dev = sim.VirtualDevice(c.get("name", sec), c["driver"], ROLE_OF[sec], float(rate), traj, inst,
-                                seed=len(devices) + 1)
+                                seed=len(devices) + 1, device=c.get("device", ""),
+                                max_range_m=float(c.get("max_range_m") or 0))
         c["port"] = dev.port
         devices.append(dev)
 
@@ -116,6 +117,8 @@ def run_profile(profile_id: str, flight_s: float = 35.0, verbose: bool = True,
     cfg["laser_altimeter"]["mounting_offset_m"] = 0.40          # the hand-entered (wrong) value
     cfg["payload_sync"].update(enabled=True, trigger_hz=2.0, method="gpio")
     cfg["buddy"]["ai"] = False
+    # Never touch this machine's GPIOs or poll a camera on the local network from a virtual flight.
+    cfg.pop("camera", None)
     cfg["mode"] = "live"
     port = free_port()
     cfg["server"]["port"] = port

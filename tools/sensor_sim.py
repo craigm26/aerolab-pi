@@ -173,6 +173,13 @@ def enc_riegl(rng_m) -> bytes:
     return f"r{rng_m:09.3f} a045\r\n".encode()
 
 
+def enc_ilm(rng_m, max_range_m=150.0) -> bytes:
+    """AgLaser ILM-150-R: 10 characters incl. CR, e.g. 00026.56m<CR>; 99999.99m<CR> = no target."""
+    if rng_m > max_range_m:
+        return b"99999.99m\r"
+    return f"{rng_m:08.2f}m\r".encode()
+
+
 def enc_ascii(rng_m) -> bytes:
     return f"{rng_m:.3f}\r\n".encode()
 
@@ -200,8 +207,9 @@ class VirtualDevice:
     """A pseudo-terminal the daemon opens like a serial port, fed by a writer thread."""
 
     def __init__(self, name: str, driver: str, role: str, rate_hz: float, traj: Trajectory,
-                 inst: Installation, seed: int = 1):
+                 inst: Installation, seed: int = 1, device: str = "", max_range_m: float = 0.0):
         self.name, self.driver, self.role = name, driver, role
+        self.device, self.max_range_m = device, max_range_m
         self.rate = rate_hz
         self.traj, self.inst = traj, inst
         self.master, self.slave = pty.openpty()
@@ -279,6 +287,8 @@ class VirtualDevice:
             out = enc_lightware(rng)
         elif d == "riegl_ld90":
             out = enc_riegl(rng)
+        elif d == "ascii_number" and self.device == "aglaser-ilm-150-r":
+            out = enc_ilm(rng, self.max_range_m or 150.0)
         elif d == "ascii_number":
             out = enc_ascii(rng)
         else:

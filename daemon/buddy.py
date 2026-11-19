@@ -65,6 +65,7 @@ class Buddy:
     db_path: Path | None = None
     configured: dict = field(default_factory=lambda: {"gnss": True, "laser": True, "imu": True})
     diagnosis: object = None          # callable -> plain-text findings with fixes (set by the daemon)
+    camera_fn: object = None          # callable -> camera snapshot dict (set by the daemon)
 
     # -- events ------------------------------------------------------------
 
@@ -111,7 +112,8 @@ class Buddy:
         names = self.names()
         configured = self.configured
 
-        for key, ok in (("gnss", s.gnss_ok), ("laser", s.laser_ok), ("imu", s.imu_ok)):
+        laser_talking = getattr(s, "laser_alive", s.laser_ok)
+        for key, ok in (("gnss", s.gnss_ok), ("laser", laser_talking), ("imu", s.imu_ok)):
             if not configured.get(key, True):
                 continue
             seen = self._flags.get(f"{key}.ever", False) or ok
@@ -121,6 +123,9 @@ class Buddy:
             elif not warmup:
                 self._edge(f"{key}.silent", True, ("warn", f"{names[key]}: no data yet. Check port and baud."), None)
 
+        if configured.get("laser", True) and laser_talking:
+            self._edge("laser.noreturn", not s.laser_ok,
+                       ("warn", f"{names['laser']}: no ground return"), ("info", f"{names['laser']}: ground return back"))
         if s.gnss_ok:
             self._edge("gnss.nofix", s.gps_fix == 0, ("warn", "GNSS has no position fix"), ("info", "GNSS fix acquired"))
             self._edge("gnss.fewsats", s.gps_fix > 0 and 0 <= s.sats < 6,
@@ -188,8 +193,10 @@ class Buddy:
                 add(names["gnss"], "ok", f"fix, {s.sats} satellites")
 
         if configured.get("laser", True):
-            if not s.laser_ok:
+            if not getattr(s, "laser_alive", s.laser_ok):
                 add(names["laser"], "fail", "no data")
+            elif not s.laser_ok:
+                add(names["laser"], "warn", "talking, but no ground return (pointing at sky, beyond range, or window blocked)")
             elif s.agl_m <= 0.5:
                 add(names["laser"], "ok", f"reads {s.agl_m:.2f} m AGL on the ground: mounting offset looks right")
             elif s.agl_m <= 3.0:
@@ -260,7 +267,8 @@ class Buddy:
         hw["payloads"] = [p.get("name") for p in cfg.get("payloads", [])]
         return {"live": state, "this_flight": stats, "recent_callouts": self.recent(10), "hardware": hw,
                 "names": self.names(), "system": self._slow or system_health(None),
-                "diagnosis": self.diagnosis() if callable(self.diagnosis) else ""}
+                "diagnosis": self.diagnosis() if callable(self.diagnosis) else "",
+                "camera": self.camera_fn() if callable(self.camera_fn) else {}}
 
     async def ask_stream(self, question: str, ctx: dict):
         """Yield answer text chunks.
@@ -370,6 +378,15 @@ def rule_answer(question: str, ctx: dict, strict: bool = False) -> str | None:
         return ctx.get("diagnosis") or status_line()
     if " why" in q and any(w in q for w in ("drop", "lost", "lose", "cut out", "fail", "stop", "gap")):
         return why_answer(q, ctx)
+    cam = ctx.get("camera") or {}
+    if cam.get("enabled") and any(w in q for w in ("camera", "photo", "picture", "image", "exposure", "rededge", "micasense")):
+        line = f"{cam['name']}: {cam['exposures']} exposures this session"
+        line += f", {cam['hz']:g} Hz now" if cam["hz"] else (", STOPPED" if cam["stopped"] else "")
+        st = cam.get("status") or {}
+        if cam.get("status_ok"):
+            line += (f". SD {st.get('sd_gb_free')} of {st.get('sd_gb_total')} GB free, auto-capture "
+                     f"{'on' if st.get('auto_cap_active') else 'OFF'}, {st.get('bus_volts')} V")
+        return line + "."
     if any(w in q for w in ("how many trigger", "trigger count", "triggers so far", "how many photo",
                             "how many picture", "how many capture")):
         return f"{s['trigger_count']} payload triggers so far this session."

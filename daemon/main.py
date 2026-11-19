@@ -33,6 +33,7 @@ import buddy as buddy_mod  # noqa: E402
 import calibration as calib  # noqa: E402
 import drivers  # noqa: E402
 import integrity as integ  # noqa: E402
+import camera as camera_mod  # noqa: E402
 import diagnose  # noqa: E402
 import ppsclock  # noqa: E402
 import rawlog  # noqa: E402
@@ -82,7 +83,9 @@ class TelemetryState:
     agl_ft: float = 0.0
     agl_quality: str = "ok"       # ok | tilt | range
     off_nadir_deg: float = 0.0
-    laser_ok: bool = False
+    laser_ok: bool = False        # a valid range in the last 2 s
+    laser_alive: bool = False     # the laser is talking (valid range or "no target") in the last 2 s
+    laser_no_return_pct: float = 0.0   # share of the last 10 s of laser output that was "no target"
     # Attitude (AHRS/IMU or GNSS/INS), after calibration
     roll_deg: float = 0.0
     pitch_deg: float = 0.0
@@ -188,6 +191,8 @@ class AeroLabDaemon:
         hud = cfg.get("hud") or {}
         self.state = TelemetryState(sim_mode=sim_mode, low_agl_warn_ft=float(hud.get("low_agl_warn_ft", 200)))
         self.last_seen = {"gnss": 0.0, "laser": 0.0, "imu": 0.0}
+        self.laser_alive_at = 0.0
+        self.laser_window: list = []          # (time, had a valid range) over the last 10 s
         self.clients: set[WebSocket] = set()
         self.tasks: list[asyncio.Task] = []
         self.trigger_pin = None
@@ -230,6 +235,10 @@ class AeroLabDaemon:
         self.mirror_dirs = [Path(d) for d in (log_cfg.get("mirror_dirs") or [])]
         self.readings = rawlog.ReadingLog(lambda: self.db_path, on_error=self._data_error)
         self.raw: dict[str, rawlog.RawWriter] = {}
+        self.camera = camera_mod.Camera(
+            cfg.get("camera"), sim=sim_mode,
+            on_exposure=lambda seq, u, m: self.readings.add("exposure", (self.state.flight_id, seq, u, m)),
+            on_status=lambda st: self.readings.add("camstatus", (self.state.flight_id, time.time_ns(), json.dumps(st))))
         tcfg = cfg.get("timing") or {}
         self.pps = ppsclock.PPSClock(tcfg.get("pps_device") if not sim_mode else None,
                                      on_edge=lambda seq, a, off: self.readings.add(
@@ -244,6 +253,7 @@ class AeroLabDaemon:
         self.findings: list = []
         self.buddy = buddy_mod.Buddy(cfg, db_path=self.db_path)
         self.buddy.diagnosis = lambda: diagnose.as_text(self.findings)
+        self.buddy.camera_fn = lambda: self.camera.snapshot()
         self.sup = Supervisor(report=lambda level, text: self.buddy.emit(level, text))
         if sim_mode:
             # The simulator plays the configured hardware: no attitude sensor -> no attitude.
@@ -423,7 +433,7 @@ class AeroLabDaemon:
             self.monitors["gnss"].on_reading(now)
         if "roll" in r:
             self.monitors["imu"].on_reading(now)
-        if "range_m" in r:
+        if "range_m" in r or "no_target" in r:
             self.monitors["laser"].on_reading(now)
         if "fix" in r:
             s.gps_fix, s.sats = int(r["fix"]), int(r.get("sats", s.sats))
@@ -465,10 +475,18 @@ class AeroLabDaemon:
             self.update_quality()
         elif "yaw" in r:
             s.yaw_deg = round(r["yaw"] % 360.0, 2)
+        if "no_target" in r:
+            self._laser_seen(now, False)
+            self.readings.add("laser", (s.flight_id, utc_ns, mono_ns, None, 0, None, s.roll_deg, s.pitch_deg))
+            return
         if "range_m" in r:
             rng = float(r["range_m"])
             if self.max_range_m and rng > self.max_range_m * 1.05:
-                return  # beyond the sensor's rated range: treat as no target
+                # beyond the sensor's rating: not used for AGL, but kept in the log
+                self._laser_seen(now, False)
+                self.readings.add("laser", (s.flight_id, utc_ns, mono_ns, rng, 0, None, s.roll_deg, s.pitch_deg))
+                return
+            self._laser_seen(now, True)
             s.laser_raw_m = round(rng, 3)
             if self.capture:
                 self.capture.add(laser_raw=rng)
@@ -477,6 +495,14 @@ class AeroLabDaemon:
                 self.last_seen["laser"] = now
             self.readings.add("laser", (s.flight_id, utc_ns, mono_ns, rng, int(ok), s.agl_m if ok else None,
                                         s.roll_deg, s.pitch_deg))
+
+    def _laser_seen(self, now: float, valid: bool):
+        self.laser_alive_at = now
+        w = self.laser_window
+        w.append((now, valid))
+        while w and now - w[0][0] > 10.0:
+            w.pop(0)
+        self.state.laser_no_return_pct = round(100.0 * sum(1 for _, v in w if not v) / len(w), 1)
 
     def extrapolated_position(self, now: float) -> tuple[float, float]:
         """Where the aircraft is now, not where it was at the last fix: last fix + ground speed x age."""
@@ -500,7 +526,7 @@ class AeroLabDaemon:
         laser reads its true mounting height, attitude sits at the bias, GNSS
         stays put with a little scatter.
 
-        With sim.faults: true, the laser drops out for 4 s every 45 s.
+        With sim.faults: true, the laser reports "no target" for 4 s every 45 s.
         With sim.start_on_ground: true, the aircraft sits on the ramp from boot
         until a ground calibration has been applied, then takes off: boot,
         calibrate, fly, as on a real day.
@@ -511,7 +537,7 @@ class AeroLabDaemon:
         true_offset = float(sc.get("laser_offset_m", 0.62))
         survey_m = float((self.cfg.get("hud") or {}).get("survey_agl_ft", 0) or 0) / M_TO_FT
         center = survey_m if survey_m > 0 else 60.0
-        swing = 0.4 * center
+        swing = 0.15 * center
         rnd = random.Random(7)
         t = 0.0
         lat, lon = 38.5816, -121.4944
@@ -545,6 +571,9 @@ class AeroLabDaemon:
                 if not (faults and 41.0 <= (t % 45.0)):
                     rng = (agl_true + true_offset) / (math.cos(math.radians(roll)) * math.cos(math.radians(pitch)))
                     self.apply({"range_m": rng + rnd.gauss(0, 0.03)}, "laser")
+                else:
+                    # a dropout: the laser keeps talking but reports "no target" (e.g. 99999.99m)
+                    self.apply({"no_target": True}, "laser")
                 t += 0.1
             await asyncio.sleep(0.1)
 
@@ -699,6 +728,7 @@ class AeroLabDaemon:
     def refresh_health(self, now: float):
         self.state.gnss_ok = (now - self.last_seen["gnss"]) < STALE_AFTER_S
         self.state.laser_ok = (now - self.last_seen["laser"]) < STALE_AFTER_S
+        self.state.laser_alive = (now - self.laser_alive_at) < STALE_AFTER_S
         self.state.imu_ok = (now - self.last_seen["imu"]) < STALE_AFTER_S
 
     async def logger_loop(self):
@@ -834,6 +864,20 @@ class AeroLabDaemon:
         if ps.get("enabled"):
             items.append({"item": "Payload trigger", "status": "ok" if s.trigger_count > 0 and (s.gpio_live or self.sim_mode) else "warn",
                           "detail": f"{s.trigger_count} pulses" + ("" if s.gpio_live else " (no GPIO pin driven)")})
+        if self.camera.enabled:
+            c = self.camera.snapshot()
+            items.append({"item": f"{c['name']} exposures",
+                          "status": "ok" if c["exposures"] and not c["stopped"] else "warn",
+                          "detail": (f"{c['exposures']} exposures, {c['hz']:g} Hz" if c["exposures"] else
+                                     ("none seen yet (camera not capturing yet, or Top-of-Frame not wired to "
+                                      f"GPIO {c['pin']})" if c["gpio_ok"] else f"GPIO {c['pin']} unavailable: {c['gpio_error']}"))})
+            if c["status_url"]:
+                st = c["status"]
+                items.append({"item": f"{c['name']} status", "status": "ok" if c["status_ok"] and st.get("sd_status") == "Ok" else "warn",
+                              "detail": (f"SD {st.get('sd_gb_free')} of {st.get('sd_gb_total')} GB free, "
+                                         f"auto-capture {'on' if st.get('auto_cap_active') else 'OFF'}, "
+                                         f"{st.get('bus_volts')} V, time source {st.get('time_source')}")
+                              if c["status_ok"] else f"not reachable at {c['status_url']}"})
         if self.pps.enabled:
             st = self.pps.status()
             items.append({"item": "GNSS PPS timing", "status": "ok" if st["ok"] else "warn", "detail": st["detail"]})
@@ -885,6 +929,22 @@ class AeroLabDaemon:
         names = b.names()
         if not self.bit.get("done"):
             return  # let the self-test report first
+        if self.camera.enabled:
+            c = self.camera.snapshot()
+            nm = c["name"]
+            b._edge("camera.stopped", c["stopped"], ("alert", f"{nm} stopped exposing"), ("info", f"{nm} exposing again"))
+            st = c["status"]
+            if c["status_ok"]:
+                b._edge("camera.sd", st.get("sd_status") not in (None, "Ok"),
+                        ("alert", f"{nm} SD card: {st.get('sd_status')}"), ("info", f"{nm} SD card OK"))
+                free = st.get("sd_gb_free")
+                b._edge("camera.sdlow", isinstance(free, (int, float)) and free < 5,
+                        ("warn", f"{nm} SD card low: {free} GB free"), None)
+                b._edge("camera.autocap", st.get("auto_cap_active") is False,
+                        ("warn", f"{nm} auto-capture is off"), ("info", f"{nm} auto-capture on"))
+            if c["status_url"]:
+                b._edge("camera.unreachable", self.steady("camstat", not c["status_ok"] and bool(c["status_age_s"]), now, 15),
+                        ("warn", f"{nm} status not reachable"), ("info", f"{nm} status reachable again"))
         for role in ("gnss", "laser", "imu"):
             if not b.configured.get(role) or self.sim_mode:
                 continue
@@ -1003,6 +1063,7 @@ table{{border-collapse:collapse;width:100%}}td,th{{border-bottom:1px solid #eee;
         d["_cal"] = self.cal_status()
         d["_data"] = self.data_status()
         d["_ready"] = self.ready
+        d["_camera"] = self.camera.snapshot()
         return json.dumps(d)
 
     def data_status(self) -> dict:
@@ -1039,6 +1100,8 @@ table{{border-collapse:collapse;width:100%}}td,th{{border-bottom:1px solid #eee;
     def start(self):
         """Every loop runs under the supervisor: a crash restarts that loop, not the flight."""
         sup = self.sup
+        if self.camera.enabled and not self.sim_mode:
+            self.camera.start_gpio()
         self.tasks = []
         if self.sim_mode:
             self.tasks.append(sup.run("simulator", self.sim_loop))
@@ -1052,6 +1115,9 @@ table{{border-collapse:collapse;width:100%}}td,th{{border-bottom:1px solid #eee;
             sup.run("reading log", self.readings.run),
             sup.run("clock", self.clock_loop, stall_s=20),
             *( [sup.run("pps", self.pps.run)] if self.pps.enabled else [] ),
+            *( [sup.run("camera", self.camera.sim_loop)] if self.camera.enabled and self.sim_mode else [] ),
+            *( [sup.run("camera status", self.camera.status_loop)]
+               if self.camera.enabled and self.camera.status_url and not self.sim_mode else [] ),
             sup.run("buddy", self.buddy_loop, stall_s=60),
             sup.run("broadcast", self.broadcast_loop, stall_s=30),
             asyncio.create_task(self.run_bit()),
@@ -1066,6 +1132,7 @@ table{{border-collapse:collapse;width:100%}}td,th{{border-bottom:1px solid #eee;
                 await t
         for w in self.raw.values():
             w.close()
+        self.camera.stop()
         # final flush of queued readings
         try:
             conn = sqlite3.connect(self.db_path)

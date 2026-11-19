@@ -151,6 +151,10 @@ CREATE TABLE IF NOT EXISTS clock_samples (
 CREATE TABLE IF NOT EXISTS triggers_exact (
     id INTEGER PRIMARY KEY AUTOINCREMENT, flight_id INTEGER, trigger_id INTEGER,
     utc_ns INTEGER, mono_ns INTEGER);
+CREATE TABLE IF NOT EXISTS exposures (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, flight_id INTEGER, seq INTEGER, utc_ns INTEGER, mono_ns INTEGER);
+CREATE TABLE IF NOT EXISTS camera_status (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, flight_id INTEGER, utc_ns INTEGER, status TEXT);
 CREATE INDEX IF NOT EXISTS laser_readings_mono ON laser_readings (mono_ns);
 CREATE INDEX IF NOT EXISTS gnss_fixes_mono ON gnss_fixes (mono_ns);
 """
@@ -162,6 +166,8 @@ INSERTS = {
             "gs_ms, track_deg) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
     "pps": "INSERT INTO pps_edges (flight_id, seq, assert_utc_ns, mono_ns, utc_minus_mono_ns) VALUES (?,?,?,?,?)",
     "clock": "INSERT INTO clock_samples (flight_id, utc_ns, mono_ns) VALUES (?,?,?)",
+    "exposure": "INSERT INTO exposures (flight_id, seq, utc_ns, mono_ns) VALUES (?,?,?,?)",
+    "camstatus": "INSERT INTO camera_status (flight_id, utc_ns, status) VALUES (?,?,?)",
     "trigger": "INSERT INTO triggers_exact (flight_id, trigger_id, utc_ns, mono_ns) VALUES (?,?,?,?)",
 }
 

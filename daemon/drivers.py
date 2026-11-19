@@ -4,6 +4,7 @@ A driver turns raw bytes from a serial port into readings. Every driver has
 the same shape: feed(bytes) -> list[dict]. A reading may carry any of:
 
     range_m                          laser altimeter slant range, metres
+    no_target                        laser is talking but measured nothing (no return)
     roll, pitch, yaw                 attitude, degrees
     lat, lon, alt_msl, fix, sats     position (fix: 0 none, 1 GPS, 2 DGPS, 4 RTK fixed, 5 RTK float)
     gnss_tod                         GNSS UTC time of day, seconds since midnight
@@ -184,10 +185,14 @@ def parse_number(text: str, unit: str = "m") -> Reading | None:
 
 
 def parse_number_filtered(text: str, unit: str = "m", invalid: tuple = ()) -> Reading | None:
-    """parse_number, dropping sentinel values a sensor uses for 'no target' (e.g. SF11/C 130.00)."""
+    """parse_number, turning the sentinel a sensor uses for 'no target' into a no_target reading.
+
+    e.g. AgLaser ILM-150-R sends 99999.99m, LightWare SF11/C 130.00. A no_target reading
+    proves the laser is alive (cable fine) even though it saw no ground.
+    """
     r = parse_number(text, unit=unit)
     if r and any(abs(r["range_m"] - v) < 1e-6 for v in invalid):
-        return None
+        return {"no_target": True}
     return r
 
 
@@ -271,7 +276,8 @@ def parse_riegl(text: str) -> Reading | None:
     """
     t = text.strip()
     if t.startswith("m"):
-        return None
+        # m........ = no target; other m-messages (OVERFLOW, SELFCHCK, LAS OFF) are status
+        return {"no_target": True} if t.startswith("m.") or t.startswith("mOVERFLOW") else None
     for tok in t.replace(",", " ").split():
         if tok[0] in "rR":
             try:
@@ -311,6 +317,8 @@ class BenewakeDriver:
             del self.buf[:9]
             dist = frame[2] | (frame[3] << 8)
             if dist == 0 or dist in self.invalid:
+                self.stats.good += 1
+                out.append({"no_target": True})
                 continue
             self.stats.good += 1
             out.append({"range_m": dist / 100.0})

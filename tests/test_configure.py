@@ -105,10 +105,15 @@ def test_default_interview_prefills_the_real_snow_survey_setup():
     assert cfg["laser_altimeter"]["device"] == "aglaser-ilm-150-r"
     assert cfg["laser_altimeter"]["baud"] == 9600 and cfg["laser_altimeter"]["max_range_m"] == 150
     assert cfg["imu_ahrs"]["enabled"] is False and cfg["imu_ahrs"]["name"] == "No attitude sensor"
-    assert [p["id"] for p in cfg["payloads"]] == ["cresis-snow-radar", "micasense-rededge-p"]
-    assert cfg["payload_sync"]["enabled"] and cfg["payload_sync"]["method"] == "gpio"
-    assert cfg["hud"]["survey_agl_ft"] == 350
-    assert not any(q.startswith("Laser range check") for q in ui.asked)
+    assert [p["id"] for p in cfg["payloads"]] == ["cresis-snow-radar", "micasense-rededge-p-timer"]
+    assert cfg["payload_sync"]["enabled"] is False          # camera captures on its own; radar is CReSIS's
+    cam = cfg["camera"]
+    assert cam["exposure_gpio"] == 27 and cam["exposure_edge"] == "falling" and cam["expected_hz"] == 1.0
+    assert cam["status_url"] == "http://192.168.1.83/status"
+    assert cfg["laser_altimeter"]["driver_options"] == {"invalid": [99999.99]}
+    assert cfg["hud"]["survey_agl_ft"] == 450
+    warn = [q for q in ui.asked if q.startswith("Laser range check")]
+    assert warn and "close to its limit" in warn[0]          # 450 ft = 137 m of a 150 m laser
 
 
 def test_ilm150_at_radar_height_warns():

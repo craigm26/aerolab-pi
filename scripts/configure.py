@@ -205,6 +205,16 @@ def build_config(base: dict, answers: dict, catalog: dict | None = None) -> dict
                            for p in pays]
         gpio = [p for p in pays if p.get("trigger") == "gpio"]
         http = [p for p in pays if p.get("trigger") == "http"]
+        mon = [p for p in pays if p.get("exposure_monitor")]
+        if mon:
+            m = mon[0]
+            cfg["camera"] = {"name": m["name"].split(" (")[0], "device": m["id"],
+                             "exposure_gpio": int(answers.get("camera.pin", 27)),
+                             "exposure_edge": "falling",
+                             "expected_hz": float(answers.get("camera.hz", m.get("expected_hz", 1.0))),
+                             "status_url": answers.get("camera.status_url", m.get("status_url", ""))}
+        else:
+            cfg.pop("camera", None)
         if gpio:
             ps["enabled"], ps["method"] = True, "gpio"
             ps["pulse_width_ms"] = max(float(p.get("pulse_width_ms", 20)) for p in gpio)
@@ -540,6 +550,21 @@ def interview(ui, base: dict, catalog: dict | None = None) -> tuple[dict, dict]:
         a["trigger.http_url"] = ui.text("Camera capture URL:", http[0].get("http_url", ""))
     if gpio or http:
         a["trigger.hz"] = ask_number(ui, "Trigger pulses per second:", a["trigger.hz"], 0.1, 10)
+    mon = [p for p in chosen if p.get("exposure_monitor")]
+    if mon:
+        m = mon[0]
+        cur = base.get("camera") or {}
+        taken_pins = {str(base["payload_sync"].get("gpio_pin", 17))} if gpio else set()
+        pins = [(p, "physical pin " + str(BCM_TO_PHYSICAL[p])) for p in TRIGGER_PINS if p not in taken_pins]
+        a["camera.pin"] = ui.menu(
+            f"{m['name'].split(' (')[0]}: which Pi GPIO gets the Top-of-Frame signal (split from the Reach time "
+            "mark wire)?", pins, default=str(cur.get("exposure_gpio", 27)))
+        period = ask_number(ui, "Camera capture period in seconds (its timer setting):",
+                            round(1.0 / float(cur.get("expected_hz") or m.get("expected_hz", 1.0)), 2), 0.33, 60)
+        a["camera.hz"] = str(round(1.0 / float(period), 4))
+        a["camera.status_url"] = ui.text(
+            "Camera status address (camera on Ethernet; leave empty if not connected):",
+            cur.get("status_url", m.get("status_url", "")))
 
     # Timing
     if mode == "live" and ui.yesno(

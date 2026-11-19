@@ -70,7 +70,7 @@ def test_benewake_frames_resync_and_sentinels():
     stream = b"\x00\x13\x59" + bene(12345) + bene(18000) + bene(4500) + bene(250)
     stream = stream[:15] + stream[15:]
     out = d.feed(stream[:10]) + d.feed(stream[10:])
-    assert [r["range_m"] for r in out] == [123.45, 2.5]
+    assert [r.get("range_m") for r in out] == [123.45, None, None, 2.5]   # 18000/4500 = no target
     corrupt = bytearray(bene(500)); corrupt[8] ^= 0xFF
     assert d.feed(bytes(corrupt)) == []
 
@@ -117,14 +117,14 @@ def test_lightware_init_packets_are_wellformed():
 
 def test_ascii_sentinel_and_units():
     d = drivers.make_driver("ascii_number", invalid=[130.0])
-    assert d.feed(b"98.67\r\n130.00\r\n?LD 45.10\r\nd\r\n") == [{"range_m": 98.67}, {"range_m": 45.1}]
+    assert d.feed(b"98.67\r\n130.00\r\n?LD 45.10\r\nd\r\n") == [{"range_m": 98.67}, {"no_target": True}, {"range_m": 45.1}]
     assert drivers.make_driver("ascii_number", unit="cm").feed(b"12345\n") == [{"range_m": 123.45}]
 
 
 def test_riegl_blocks():
     d = drivers.make_driver("riegl_ld90")
     assert d.feed(b"r0712.345 a045\r\n") == [{"range_m": 712.345}]
-    assert d.feed(b"m........\r\nmOVERFLOW\r\n") == []
+    assert d.feed(b"m........\r\nmOVERFLOW\r\nmSELFCHCK\r\n") == [{"no_target": True}, {"no_target": True}]
 
 
 def test_mavlink_attitude_and_gps():
@@ -137,3 +137,10 @@ def test_mavlink_attitude_and_gps():
     out = d.feed(att + gps)
     assert out[0]["roll"] == pytest.approx(5.7296, abs=1e-3) and out[0]["yaw"] == pytest.approx(171.887, abs=1e-2)
     assert out[1]["fix"] == 1 and out[1]["sats"] == 14 and out[1]["alt_msl"] == 450.0
+
+
+def test_aglaser_ilm150_documented_format():
+    """AgLaser RS232 guide: 10 characters incl. CR, e.g. 00026.56m<cr>; 99999.99m<cr> = no target."""
+    d = drivers.make_driver("ascii_number", invalid=[99999.99])
+    out = d.feed(b"00026.56m\r00137.20m\r99999.99m\r00000.51m\r")
+    assert out == [{"range_m": 26.56}, {"range_m": 137.2}, {"no_target": True}, {"range_m": 0.51}]

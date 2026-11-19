@@ -62,7 +62,7 @@ Most affordable lasers stop far short of survey heights:
 | Laser | Rated range | Height that is |
 |---|---|---|
 | Benewake TF02-Pro | about 40 m | 130 ft |
-| AgLaser ILM-150-R | 150 m (90% white), 75 m (18% grey) | 490 ft |
+| AgLaser ILM-150-R | 150 m (90% white), 75 m (18% grey) | 490 ft (planned legs: 450 ft) |
 | LightWare LW20/C | 100 m | 330 ft |
 | LightWare SF11/C | 120 m | 390 ft |
 | Benewake TF03-180 | 180 m (90% target), 70 m (10%) | 590 ft |
@@ -85,12 +85,18 @@ Snow and ice reflect well, but fresh snow at a shallow angle, glassy ice and ope
 
 The default profile is a light-aircraft snow survey:
 
-- Reach M2 for position and time, with raw logging on the Reach for PPK;
-- the ILM-150-R laser at 9 Hz;
-- a RedEdge-P triggered once a second;
-- the 2-8 GHz snow radar recording on its own GPS.
+- Reach M2 for position and time over NMEA, with raw logging on the Reach for PPK;
+- the ILM-150-R laser at 9 Hz (format from the AgLaser RS-232 guide: `00026.56m`, with `99999.99m` for no target);
+- a RedEdge-P capturing on its own timer, its exposures time-marked on the Reach and watched by the Pi;
+- the 2-8 GHz snow radar, run by CReSIS.
 
-Attitude and georeferencing are applied in post-processing, so the live AGL is labelled "not tilt-corrected". The ILM-150-R is rated to 150 m: laser legs need to be around 350 ft AGL. At the 2,000-2,500 ft radar height it reads nothing, and setup says so.
+Attitude and georeferencing are applied in post-processing, so the live AGL is labelled "not tilt-corrected".
+
+The ILM-150-R is rated to 150 m, and the planned laser legs at 450 ft (137 m) are close to that. Setup says so, and in flight the display separates two cases:
+- **"NO RETURN":** the laser is working but saw no ground, and the no-return rate is shown;
+- **"---":** the laser has gone silent (cable or power).
+
+At the 2,000-2,500 ft radar height the laser reads nothing.
 
 ## Buddy
 
@@ -332,13 +338,34 @@ The Pi's pins are 3.3 V. A device listed as RS-232 or RS-422 needs a USB-RS232/R
 
 | From | To | Notes |
 |---|---|---|
-| Reach M2 S1: pin 4 TX, pin 5 RX, pin 1 GND | Pi pin 10 (RX), pin 8 (TX), a ground pin | 3.3 V on both sides; no adapter. Reach output: NMEA, 10 Hz, 115200 baud |
+| Reach M2 S1: pin 4 TX, pin 5 RX, pin 1 GND | Pi pin 10 (RX), pin 8 (TX), a ground pin | 3.3 V both sides, no adapter. Reach position output: Serial, NMEA, 10 Hz, 115200 baud |
 | Reach M2 C1 pin 3 (PPS), pin 1 GND | Pi GPIO 18 (pin 12), a ground pin | answer yes to the PPS question in setup |
-| ILM-150-R DB9 (data out pin 2, ground pin 5) | USB-RS232 adapter (FTDI) → Pi USB | the laser needs its own 9-24 V supply on the red/black leads |
-| Pi GPIO 17 (pin 11) | RedEdge-P host GPIO set to Trigger input, rising edge | grounds joined; at most 3 captures/s |
-| RedEdge-P GPIO set to Top-of-Frame output, active low | Reach M2 C1 pin 2 (time mark) | every exposure lands in the Reach raw log on GPS time |
+| ILM-150-R data out (its TX), ground | FTDI US232R-100 DB9 pin 2 (RX), pin 5 (GND) → Pi USB | laser data in (its RX) to DB9 pin 3 is optional: it streams on power-up. The laser needs its own 9-24 V dc |
+| RedEdge-P pin set to Top of Frame Output, and camera ground | Reach M2 C1 pin 2 (time mark) **and** Pi GPIO 27 (pin 13); grounds joined | the exact exposure record goes to the Reach raw log; the Pi logs a backup copy and watches the rate |
+| RedEdge-P Ethernet | Pi Ethernet | optional: camera status (SD space, auto-capture, volts). Pi address 192.168.1.x, camera 192.168.1.83 |
 
-On the Reach, turn on raw data logging (UBX or RINEX, 10 Hz). That log is the science-grade position record for PPK; AeroLab-Pi's copy is for the live display and the first match.
+**ILM-150-R through a Souriau (or any non-DB9) harness.** The US232R-100 ends in a standard DB9 male:
+- pin 2 is the adapter's receive;
+- pin 3 its transmit;
+- pin 5 ground.
+
+On the harness side you need only the laser's transmit and ground. To find them:
+1. With the laser powered and the adapter unplugged, measure each signal pin against ground. The laser's transmit idles at about −5 to −12 V (RS-232 "mark"); its receive reads near 0 V.
+2. Never connect the 9-24 V supply pin to the adapter.
+3. Check with `python scripts/probe.py /dev/serial/by-id/usb-FTDI_US232R…`. At 9600 baud you should see lines like `00026.56m`.
+4. If the AgLaser cockpit display must stay connected, the laser's transmit can feed both the display and the adapter (one RS-232 transmitter can drive two receivers), as long as all grounds are joined.
+
+**The camera captures on its own.** In the RedEdge-P web page:
+- set **Auto capture mode** to *timer* with your period;
+- set one pin to **Top of Frame Output**. It rests high and falls at the top of each frame, which is what the Reach time mark expects.
+
+The camera stores every image itself; nothing the Pi does can stop it. The Pi only watches:
+- **Exposures:** every exposure is logged (`exposures` table), and `python tools/export_exposures.py` puts them on GNSS time with positions, so you can check none are missing from the Reach time marks.
+- **Callouts:** Buddy calls out if the camera stops exposing, auto-capture goes off, or its SD card runs low.
+
+**CReSIS radar.** Acquisition and sync are run by CReSIS on the radar's own system; nothing connects to the Pi. Everything AeroLab-Pi logs is on GNSS time, so the radar data aligns in processing.
+
+On the Reach, turn on raw data logging (UBX or RINEX, 10 Hz). That log is the science-grade position record for PPK, and holds the camera time marks. AeroLab-Pi's copy is for the live display and the first match.
 
 Measure `mounting_offset_m`: the vertical distance from the laser lens down to the lowest point of the aircraft. On the ground the display, and the Buddy ground check, should read 0.
 
@@ -363,6 +390,7 @@ Everything sits in the log directory.
 - `raw/<sensor>_<time>.aeroraw`: every byte from every sensor with arrival timestamps (see [Data you don't lose](#data-you-dont-lose)).
 - `aerolab_flight.db`, tables `laser_readings`, `gnss_fixes`: every reading, with `utc_ns` and `mono_ns`.
 - `aerolab_flight.db`, tables `pps_edges`, `clock_samples`, `triggers_exact`: timing for post-processing.
+- `aerolab_flight.db`, tables `exposures`, `camera_status`: every camera exposure the Pi saw, and the camera's status every 5 s. Laser no-returns are in `laser_readings` with an empty range.
 - `flight_<n>_readiness.html`: the readiness report for each flight.
 
 - `aerolab_flight.db`, table `telemetry`: every sample at `log_hz` (5 Hz default), including per-sensor health flags.
@@ -380,7 +408,7 @@ A VectorNav GNSS/INS reports height above the ellipsoid, not sea level. The disp
 
 ```bash
 .venv/bin/pip install -r requirements-dev.txt
-.venv/bin/python -m pytest -m "not slow"     # 95 tests, about 25 s
+.venv/bin/python -m pytest -m "not slow"     # 100 tests, about 25 s
 .venv/bin/python -m pytest                   # plus 3 end-to-end virtual flights, about 2.5 min
 python tools/virtual_flight.py               # every profile, with a full report
 ```

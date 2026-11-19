@@ -351,7 +351,7 @@
       done: false,
       rows: [
         ["LINK", "link"], ["GNSS", "gnss"], ["LASER", "laser"], ["ATTITUDE", "imu"],
-        ["LOGGER", "log"], ["TIMING", "time"], ["TRIGGER", "trig"], ["CALIBRATION", "cal"], ["BUDDY", "buddy"], ["SELF-TEST", "bit"],
+        ["LOGGER", "log"], ["TIMING", "time"], ["PAYLOAD", "trig"], ["CALIBRATION", "cal"], ["BUDDY", "buddy"], ["SELF-TEST", "bit"],
       ],
       init() {
         const word = "AEROLAB-PI";
@@ -402,7 +402,8 @@
           : d.gnss_ok ? this.set("gnss", d.gps_fix > 0 ? "ok" : "warn", (d.gps_fix > 0 ? "FIX" : "NO FIX") + (d.sats >= 0 ? ` · ${d.sats} SATS` : ""))
           : this.waitOr("gnss", "err", "NO DATA"));
         step(2, () => !cfgd.laser ? this.set("laser", "off", "NOT FITTED")
-          : d.laser_ok ? this.set("laser", "ok", `${d.laser_raw_m.toFixed(1)} M`) : this.waitOr("laser", "err", "NO DATA"));
+          : d.laser_ok ? this.set("laser", "ok", `${d.laser_raw_m.toFixed(1)} M`)
+          : d.laser_alive ? this.set("laser", "warn", "TALKING · NO RETURN") : this.waitOr("laser", "err", "NO DATA"));
         step(3, () => !cfgd.imu ? this.set("imu", "off", "NONE · POST-PROCESSED")
           : d.imu_ok ? this.set("imu", "ok", `ROLL ${d.roll_deg.toFixed(0)}° PITCH ${d.pitch_deg.toFixed(0)}°`) : this.waitOr("imu", "err", "NO DATA"));
         step(4, () => d.logging_active
@@ -414,7 +415,9 @@
           p.enabled ? (p.ok ? this.set("time", "ok", `PPS · ${Number(p.clock_offset_ms).toFixed(2)} MS`) : this.set("time", "warn", "PPS: NO PULSES"))
                     : this.set("time", "off", d.gnss_time_offset_s != null ? `GNSS TIME · ${Number(d.gnss_time_offset_s).toFixed(1)} S` : "GNSS EPOCH TIME");
         });
-        step(5, () => d.trigger_count > 0 ? this.set("trig", d.gpio_live ? "ok" : "warn", d.gpio_live ? "PULSING" : "NO GPIO")
+        step(5, () => (d._camera || {}).enabled
+          ? ((d._camera.exposures ? this.set("trig", "ok", `CAMERA · ${d._camera.exposures} EXPOSURES`) : this.set("trig", "warn", "CAMERA: NO EXPOSURES")))
+          : d.trigger_count > 0 ? this.set("trig", d.gpio_live ? "ok" : "warn", d.gpio_live ? "PULSING" : "NO GPIO")
           : this.set("trig", "off", "OFF"));
         step(6, () => {
           const c = (d._cal || {}).calibration || {};
@@ -482,9 +485,11 @@
     function render(d) {
       $("simtag").classList.toggle("show", !!d.sim_mode);
       const agl = $("agl-ft");
-      agl.textContent = d.laser_ok ? Math.round(d.agl_ft) : "---";
-      agl.classList.toggle("agl-low", d.laser_ok && d.agl_ft < d.low_agl_warn_ft);
-      agl.classList.toggle("agl-stale", !d.laser_ok);
+      const noReturn = !d.laser_ok && d.laser_alive;      // laser talking, no ground: not a fault in the wiring
+      agl.textContent = d.laser_ok ? Math.round(d.agl_ft) : (noReturn ? "NO RETURN" : "---");
+      agl.style.fontSize = noReturn ? "clamp(2.2rem, 7vw, 4.5rem)" : "";
+      agl.classList.toggle("agl-low", (d.laser_ok && d.agl_ft < d.low_agl_warn_ft) || noReturn);
+      agl.classList.toggle("agl-stale", !d.laser_ok && !noReturn);
 
       $("agl-m").textContent = d.agl_m.toFixed(1);
       $("raw-m").textContent = d.laser_raw_m.toFixed(1);
@@ -506,11 +511,20 @@
       if (c.gnss) setPill("p-gnss", d.gnss_ok && d.gps_fix > 0 ? "ok" : (d.gnss_ok ? "warn" : "err"),
                           d.gnss_ok && d.gps_fix === 0 ? `NO FIX${d.sats >= 0 ? ` (${d.sats})` : ""}` : `GNSS (${d.sats >= 0 ? d.sats : "INS"})`);
       else setPill("p-gnss", "off", "GNSS —");
-      if (c.laser) setPill("p-laser", d.laser_ok ? "ok" : "err", "LASER"); else setPill("p-laser", "off", "LASER —");
+      if (c.laser) setPill("p-laser", d.laser_ok ? (d.laser_no_return_pct > 20 ? "warn" : "ok") : (d.laser_alive ? "warn" : "err"),
+                           d.laser_ok ? (d.laser_no_return_pct > 20 ? `LASER ${Math.round(100 - d.laser_no_return_pct)}%` : "LASER")
+                                      : (d.laser_alive ? "LASER NO RTN" : "LASER"));
+      else setPill("p-laser", "off", "LASER —");
       if (c.imu) setPill("p-imu", d.imu_ok ? "ok" : "err", "IMU"); else setPill("p-imu", "off", "IMU —");
       setPill("p-log", d.logging_active ? "ok" : "err", d.sim_mode ? "LOG (SIM)" : (d.logging_active ? "LOGGING" : "NOT LOGGING"));
-      setPill("p-sync", d.trigger_count === 0 ? "off" : (d.gpio_live ? "ok" : "warn"),
-              `TRIG: ${d.trigger_count}${d.gpio_live || d.trigger_count === 0 ? "" : " (NO GPIO)"}`);
+      const cam = d._camera || {};
+      if (cam.enabled) {
+        setPill("p-sync", cam.stopped || !cam.exposures ? (cam.exposures ? "err" : "warn") : "ok",
+                cam.stopped ? "CAM STOPPED" : (cam.exposures ? `CAM ${cam.hz.toFixed(1)} HZ · ${cam.exposures}` : "CAM: NO EXPOSURES"));
+      } else {
+        setPill("p-sync", d.trigger_count === 0 ? "off" : (d.gpio_live ? "ok" : "warn"),
+                `TRIG: ${d.trigger_count}${d.gpio_live || d.trigger_count === 0 ? "" : " (NO GPIO)"}`);
+      }
 
       $("coords").textContent = `LAT: ${d.lat.toFixed(5)} | LON: ${d.lon.toFixed(5)}`;
       $("logfile").textContent = `LOG: ${d.log_file || "---"}`;

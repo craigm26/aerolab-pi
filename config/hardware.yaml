@@ -19,29 +19,29 @@ lasers:
   - id: aglaser-ilm-150-r
     name: AgLaser ILM-150-R
     driver: ascii_number
+    driver_options: {invalid: [99999.99]}
     rate_hz: 9
     baud: 9600
-    interface: RS-232 at 9600 baud; USB-RS232 adapter (FTDI chip preferred)
+    interface: RS-232 at 9600 baud 8N1; USB-RS232 adapter (FTDI US232R-100 or similar)
     max_range_m: 150
-    confidence: unverified
+    confidence: manual
     notes: >-
-      Measurement Devices Ltd IM150 laser module (also sold as the Carlson
-      ILM-R). 150 m on a 90% white target, 75 m on 18% grey, 0.5 m minimum;
-      10 cm accuracy, 9 Hz max; 905 nm, Class 1M; 9-24 V dc, under 5 W; IP67.
-      RS-232 9600 baud. The exact output line is not confirmed: AeroLab-Pi
-      reads the first number on each line as metres and keeps every raw byte,
-      so nothing is lost if the format differs. Check it on the bench with
-      scripts/probe.py. Fischer pin 5 is a "trigger out" (not on the DB9 lead):
-      possibly a per-measurement pulse for the Reach M2 time mark; unverified.
-    source: https://cdn.robotshop.com/media/m/mrp/rb-mrp-01/pdf/carlson_ilm-r.pdf
+      Mindrum/AgLaser Industrial Laser Module (Measurement Devices Ltd IM150,
+      also sold as the Carlson ILM-R). Starts measuring at 9 Hz on power-up, no
+      command needed. Each reading is 10 characters, e.g. "00026.56m<CR>";
+      "99999.99m<CR>" means no target (logged as a no-return, never as a range).
+      9600 8N1, no flow control. Range is measured from the rearmost mounting
+      hole, 40 mm behind the lens; the ground calibration takes care of it.
+      150 m on a 90% white target, 75 m on 18% grey; 9-24 V dc, under 5 W.
+    source: https://mindrumlasers.com/wp-content/uploads/2020/01/RS232-Communication-Guide.pdf
     troubleshooting:
       no_data:
-        - "It needs its own 9-24 V supply (red/black flying leads on the adaptor cable); the RS-232 lead carries no power."
-        - "RS-232 levels: connect through a USB-RS232 adapter, never to the Pi's GPIO pins."
-        - "DB9: data out is pin 2, data in pin 3, ground pin 5. A null-modem adapter in the chain swaps 2 and 3: try with or without it."
-        - "9600 baud. Run scripts/probe.py on the port to see exactly what it sends."
+        - "It needs its own 9-24 V dc supply; the RS-232 lines carry no power. After power-up it runs a startup routine, then streams at 9 Hz."
+        - "Only two wires are needed: laser data out (its TX) to the adapter's RX, and ground to ground. On an FTDI US232R-100 (DB9 male) that is pin 2 (RX) and pin 5 (GND). The laser's data in is optional (adapter pin 3, TX)."
+        - "Finding the pins on a Souriau (or any) harness: with the laser powered and the adapter unplugged, measure each signal pin to ground with a multimeter. The laser's TX sits at about -5 to -12 V when idle (RS-232 mark); its RX reads near 0 V. Never connect the 9-24 V supply pin to the adapter."
+        - "Check the format with scripts/probe.py: at 9600 baud you should see lines like 00026.56m."
       range:
-        - "Rated 150 m on white, 75 m on grey targets. Snow is bright, but above about 450 ft AGL expect no returns; fly laser legs lower."
+        - "Rated 150 m on white, 75 m on grey targets. At 450 ft (137 m) you are near the limit: expect more no-returns over dark, wet or fresh snow at a shallow angle. The no-return rate is on the display and in the log."
       spikes:
         - "Check the window for frost, dirt or condensation; at altitude in cold air the window can ice."
         - "Open water and glassy ice can return nothing or a weak, wrong range."
@@ -414,11 +414,31 @@ payloads:
     trigger: none
     confidence: secondary
     notes: >-
-      FMCW snow radar with its own GPS receiver in the chassis; it records
-      continuously and needs no trigger. Line up its data with AeroLab-Pi's
-      attitude log by GPS time in processing (antenna lever arm and roll/pitch
-      corrections use the INS trajectory).
+      Acquisition and synchronisation are run by CReSIS on the radar's own
+      system, with its own GPS; nothing to connect to the Pi. Align its data
+      with the laser, camera and Reach records by GNSS time in processing.
     source: https://par.nsf.gov/servlets/purl/10629665
+
+  - id: micasense-rededge-p-timer
+    name: MicaSense RedEdge-P (captures on its own timer, exposures monitored)
+    kind: camera
+    trigger: none
+    exposure_monitor: true
+    expected_hz: 1.0
+    status_url: http://192.168.1.83/status
+    max_hz: 3
+    confidence: manual
+    notes: >-
+      The camera captures and stores images by itself: in its web page set
+      Auto capture mode to "timer" and the period (config: auto_cap_mode
+      "timer", timer_period). Set one camera pin to "Top of Frame Output"
+      (pin_modes 129); the pulse rests high and its falling edge is the top
+      of frame. Wire it to the Reach M2 time mark (C1 pin 2): every exposure
+      is stamped in the Reach raw log on GPS time. Also wire the same signal
+      to a Pi GPIO: the Pi logs every exposure as a backup and calls out if
+      the camera stops. With the camera on Ethernet, the Pi also reads its
+      status (SD space, auto-capture on, supply volts, GPS, time source).
+    source: http://micasense.github.io/rededge-api/api/http.html
 
   - id: micasense-rededge-p
     name: MicaSense RedEdge-P (trigger pin)
@@ -504,18 +524,18 @@ profiles:
     gnss: emlid-reach-m2
     attitude: none-post
     laser: aglaser-ilm-150-r
-    payloads: [cresis-snow-radar, micasense-rededge-p]
+    payloads: [cresis-snow-radar, micasense-rededge-p-timer]
     trigger_hz: 1.0
-    survey_agl_ft: 350
-    low_agl_warn_ft: 250
+    survey_agl_ft: 450
+    low_agl_warn_ft: 300
     notes: >-
-      Reach M2 for position and time (raw logging on the Reach for PPK), the
-      ILM-150-R laser at 9 Hz, a RedEdge-P triggered once a second, and the
-      2-8 GHz snow radar recording on its own GPS. Attitude and georeferencing
-      are applied in post-processing, so the live AGL is not tilt-corrected.
-      The ILM-150-R is rated to 150 m (75 m on dark targets): plan laser legs at
-      about 350 ft AGL; above roughly 450 ft expect dropouts, and at the
-      2000-2500 ft radar height it will read nothing.
+      Reach M2 for position and time over NMEA (raw logging on the Reach for
+      PPK), the ILM-150-R laser at 9 Hz, a RedEdge-P capturing on its own timer
+      with every exposure monitored and time-marked, and the 2-8 GHz snow radar
+      run by CReSIS. Attitude and georeferencing are applied in post-processing,
+      so the live AGL is not tilt-corrected. Laser legs at about 450 ft AGL
+      (137 m), close to the ILM-150-R's 150 m rating: the no-return rate is
+      shown live. At the 2000-2500 ft radar height the laser reads nothing.
       Every laser reading and every GNSS byte is logged with timestamps.
 
   - id: long-range-survey

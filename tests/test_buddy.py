@@ -10,7 +10,7 @@ import main  # noqa: E402
 
 
 def make(**kw):
-    s = main.TelemetryState(gnss_ok=True, gps_fix=1, sats=11, laser_ok=True, imu_ok=True,
+    s = main.TelemetryState(gnss_ok=True, gps_fix=1, sats=11, laser_ok=True, laser_alive=True, imu_ok=True,
                             logging_active=True, agl_ft=500, agl_m=152, low_agl_warn_ft=200, log_file="f.csv")
     for k, v in kw.items():
         setattr(s, k, v)
@@ -32,8 +32,8 @@ def test_sensor_lost_and_back_are_edge_triggered(tmp_path):
     bd = b()
     bd.evaluate(make(), tmp_path, False)
     assert texts(bd) == []
-    bd.evaluate(make(laser_ok=False), tmp_path, False)
-    bd.evaluate(make(laser_ok=False), tmp_path, False)       # still lost: no repeat
+    bd.evaluate(make(laser_ok=False, laser_alive=False), tmp_path, False)
+    bd.evaluate(make(laser_ok=False, laser_alive=False), tmp_path, False)   # still lost: no repeat
     bd.evaluate(make(), tmp_path, False)
     assert texts(bd) == ["Laser altimeter lost", "Laser altimeter back"]
     assert [e.level for e in bd.events] == ["alert", "info"]
@@ -144,3 +144,13 @@ def test_ask_falls_back_without_ollama():
 def test_context_text_is_compact():
     t = buddy.context_text(ctx())
     assert "AGL 500 ft" in t and len(t) < 1200
+
+
+def test_laser_no_return_is_not_laser_lost(tmp_path):
+    bd = b()
+    bd.evaluate(make(), tmp_path, False)
+    bd.evaluate(make(laser_ok=False, laser_alive=True), tmp_path, False)   # talking, "99999.99m"
+    bd.evaluate(make(), tmp_path, False)
+    assert texts(bd) == ["Laser altimeter: no ground return", "Laser altimeter: ground return back"]
+    items = {i["item"]: i for i in bd.ground_check(make(laser_ok=False, laser_alive=True), {}, tmp_path, False)}
+    assert items["Laser altimeter"]["status"] == "warn" and "no ground return" in items["Laser altimeter"]["detail"]
