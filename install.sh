@@ -159,6 +159,45 @@ if [[ -n "$PPS_PIN" ]]; then
     sudo apt-get install -y pps-tools > /dev/null || true
   fi
 fi
+if grep -qx chrony <<<"$NEEDS"; then
+  run sudo apt-get install -y chrony
+  # /run/chrony is owned by _chrony:_chrony (0750), and chronyd creates SOCK
+  # refclock sockets as root before dropping privileges. Put the service user
+  # in _chrony and make the socket group-writable via a systemd drop-in.
+  run sudo usermod -aG _chrony "$RUN_USER"
+  run sudo mkdir -p /etc/chrony/conf.d
+  if [[ -n "$PPS_PIN" ]]; then
+    write_file /etc/chrony/conf.d/aerolab.conf <<'EOF'
+# AeroLab-Pi: set the Pi system clock from GNSS and PPS via chrony.
+# The Pi has no battery-backed RTC, so allow stepping whenever offset exceeds 1 s.
+makestep 1.0 -1
+
+# Coarse GNSS time from the daemon; noselect prevents serial jitter from pulling
+# the clock off PPS while still giving PPS the whole second to lock onto.
+refclock SOCK /run/chrony/aerolab.sock refid GNSS offset 0.05 delay 0.2 noselect
+refclock PPS /dev/pps0 lock GNSS refid PPS prefer
+EOF
+  else
+    write_file /etc/chrony/conf.d/aerolab.conf <<'EOF'
+# AeroLab-Pi: set the Pi system clock from GNSS via chrony.
+# The Pi has no battery-backed RTC, so allow stepping whenever offset exceeds 1 s.
+makestep 1.0 -1
+
+# GNSS time from the daemon over the chrony SOCK interface.
+# offset 0.05 compensates for typical NMEA serial latency; delay 0.2 reflects serial jitter.
+refclock SOCK /run/chrony/aerolab.sock refid GNSS offset 0.05 delay 0.2
+EOF
+  fi
+  run sudo mkdir -p /etc/systemd/system/chrony.service.d
+  write_file /etc/systemd/system/chrony.service.d/aerolab.conf <<'EOF'
+[Service]
+# chronyd creates the SOCK refclock socket as root before dropping privileges.
+# Make it group-writable for _chrony so the non-root aerolab daemon can send samples.
+ExecStartPost=/bin/sh -c 'for i in 1 2 3 4 5 6 7 8 9 10; do [ -S /run/chrony/aerolab.sock ] && break; sleep 0.2; done; chgrp _chrony /run/chrony/aerolab.sock && chmod 660 /run/chrony/aerolab.sock'
+EOF
+  run sudo systemctl daemon-reload
+  run sudo systemctl restart chrony
+fi
 MODEL="$(grep '^ollama:' <<<"$NEEDS" | cut -d: -f2- || true)"
 if [[ -n "$MODEL" ]]; then
   if ! command -v ollama >/dev/null 2>&1; then

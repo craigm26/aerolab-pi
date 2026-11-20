@@ -176,7 +176,7 @@ Switch the power off when the Pi's green LED stops.
 - **Continuously:** raw sensor captures.
 - **At every STOP:** the whole survey package, including the database, exports, camera status and reports, verified by SHA-256.
 
-The camera's images stay on its own card.
+The camera's images stay on its own card during flight. After landing on ground power, tap **COPY CAMERA IMAGES TO PI** in the survey sheet to copy them over Ethernet into `camera_images/<time>/` on the log disk with a `MANIFEST.sha256` and `copy_report.json`. Copying refuses to start or pauses automatically while a survey is recording or the aircraft is moving, checks for 2 GB of spare disk space, and resumes where it left off if cancelled or interrupted.
 
 ## Bench tools for the installation
 
@@ -221,6 +221,8 @@ Rows are committed every 0.5 s. The 5 Hz `telemetry` table is only the display s
 **Timing hardware.**
 - **PPS:** wire the Reach M2's PPS (C1 or C2 pin 3) to Pi GPIO 18 and answer yes in setup. The installer enables the kernel PPS driver (`pps-rp1` on a Pi 5), and every edge is logged with the Pi clock's offset from the GPS second.
 - **USB-serial latency:** FTDI adapters buffer up to 16 ms by default; the installer sets 1 ms with a udev rule. CP210x, CH340 and PL2303 adapters have no such setting, so use FTDI for the laser.
+
+**System clock from GNSS (chrony).** Answer yes to the GNSS clock sync question in `./configure.sh` and the installer configures `chrony` to discipline the Pi's system clock offline from GNSS time fed over a Unix socket (`/run/chrony/aerolab.sock`), locked to `/dev/pps0` when PPS is wired, with `makestep` so a Pi with no RTC steps straight to true UTC after a fix arrives. The boot self-test and Buddy Checks report whether chrony is synced and its offset.
 
 **Readiness, with the fixes.** Buddy → Checks opens with one verdict:
 - "Ready: every sensor is recording";
@@ -457,7 +459,7 @@ Everything sits in the log directory.
 - Telemetry also keeps `laser_used_m` (after the spike gate), `agl_quality`, the raw attitude before calibration, `hdop`, ground speed and track, and both the extrapolated position (`lat`, `lon`) and the last fix (`fix_lat`, `fix_lon`, `gnss_age_ms`). Trigger rows keep the same, plus each sensor's sample age at the trigger.
 - `flight_YYYYMMDD_HHMMSS.csv`: the same samples as `telemetry`, one file per 5 minutes, times in UTC.
 
-The Pi has no battery-backed clock unless a coin cell is fitted (Pi 5), so without internet the system time can be wrong at boot. Buddy's ground check compares the clock with GNSS time and warns when they differ by more than a second. Setting the clock from GNSS is not done yet.
+The Pi has no battery-backed clock unless a coin cell is fitted (Pi 5), so without internet the system time can be wrong at boot. When GNSS clock sync is enabled in `./configure.sh`, AeroLab-Pi feeds GNSS time (and PPS when wired) to `chrony` so the Pi steps and locks its system clock to UTC offline. Buddy's ground check and the boot self-test also check the clock against GNSS and chrony.
 
 A VectorNav GNSS/INS reports height above the ellipsoid, not sea level. The display labels it HAE.
 

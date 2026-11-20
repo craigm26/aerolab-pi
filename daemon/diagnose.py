@@ -199,7 +199,22 @@ def findings(d, catalog: dict | None = None) -> list[dict]:
             add("warn", f"{c['name']}: SD card low", f"{st['sd_gb_free']} GB free",
                 ["Swap or empty the camera's card before the next flight."])
 
-    # ---- timing (PPS)
+    # ---- camera image copy
+    copier = getattr(d, "camera_copy", None)
+    if copier is not None:
+        failed = copier.last_failed_files()
+        if failed:
+            shown = ", ".join(str(f.get("path", f)) if isinstance(f, dict) else str(f) for f in failed[:5])
+            if len(failed) > 5:
+                shown += f" (+{len(failed) - 5} more)"
+            add("info",
+                f"Last camera image copy had {len(failed)} failed file(s)",
+                shown,
+                ["Check the Ethernet cable between the Pi and the camera, and confirm the camera is powered.",
+                 "Run COPY CAMERA IMAGES TO PI again on the ground: completed files are skipped and failed files are retried.",
+                 "If a file keeps failing, back up the camera's SD card directly and check it with tools/check_camera_backup.py."])
+
+    # ---- timing (PPS and chrony system clock)
     pps = getattr(d, "pps", None)
     if pps is not None and pps.enabled:
         st = pps.status()
@@ -208,6 +223,21 @@ def findings(d, catalog: dict | None = None) -> list[dict]:
                 ["Check the GNSS PPS output is wired to the configured GPIO and shares ground with the Pi.",
                  "Check `/boot/firmware/config.txt` has the pps-gpio overlay on that pin, then reboot.",
                  "Without PPS, timing comes from GNSS epoch times (milliseconds instead of microseconds)."])
+    tsync = getattr(d, "timesync", None)
+    if tsync is not None and tsync.enabled:
+        tst = tsync.status()
+        if not tst["synced"]:
+            steps = [
+                "Check chrony is installed (`chronyc --version`) and `/etc/chrony/conf.d/aerolab.conf` is present "
+                "(re-run `./install.sh` if missing).",
+                "Run `chronyc sources` to confirm the GNSS socket and PPS refclocks are receiving samples.",
+                "Wait for a GNSS position fix; chrony only locks once valid GNSS timestamps arrive.",
+            ]
+            if pps is not None and pps.enabled:
+                steps.append("Check the PPS wiring (GNSS PPS to the configured Pi GPIO, shared ground) and `/dev/pps0`.")
+            else:
+                steps.append("If PPS is wired, check the PPS wiring and enable PPS in `./configure.sh` for microsecond sync.")
+            add("warn", "System clock not synced to GNSS", tst["detail"] or "chrony not synchronised", steps)
 
     # ---- calibration
     if not d.cal.updated:

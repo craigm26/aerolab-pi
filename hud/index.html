@@ -751,6 +751,8 @@
     let svPending = null;          // readiness result waiting for "start anyway"
     let svBusy = false;
     let sdBusy = false;            // shutdown request in flight
+    let ccBusy = false;            // camera image copy start request in flight
+    let ccError = "";
     const fmtDur = (s) => { s = Math.max(0, Math.floor(s)); const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), x = s % 60;
       return (h ? h + ":" + String(m).padStart(2, "0") : m) + ":" + String(x).padStart(2, "0"); };
     function holdButton(id, ms, onDone) {
@@ -798,6 +800,70 @@
       } else {
         el.style.color = "var(--muted)";
         el.textContent = "Reach raw log: waiting for status...";
+      }
+    }
+    function updateCameraCopy(box, d) {
+      if (!box) return;
+      const cc = (d && d._camera_copy) || {};
+      const active = cc.state === "checking" || cc.state === "copying" || cc.state === "paused";
+      if (active) {
+        if (box.dataset.mode !== "active") {
+          box.dataset.mode = "active";
+          box.innerHTML = `<div class="msgline" id="cc-msg"></div>` +
+            `<div class="bar"><div id="cc-bar"></div></div>` +
+            `<div class="note" id="cc-meta"></div>` +
+            `<button class="huge ghost" id="cc-cancel"><span>CANCEL</span></button>`;
+          $("cc-cancel").onclick = cancelCameraCopy;
+        }
+        const bDone = cc.bytes_done || 0, bTot = cc.bytes_total || 0;
+        const fDone = cc.files_done || 0, fTot = cc.files_total || 0;
+        const pct = bTot > 0 ? Math.min(100, Math.round(100 * bDone / bTot)) : (fTot > 0 ? Math.min(100, Math.round(100 * fDone / fTot)) : 0);
+        $("cc-bar").style.width = `${pct}%`;
+        const msgEl = $("cc-msg");
+        if (cc.state === "checking") {
+          msgEl.style.color = "var(--text)";
+          msgEl.textContent = cc.message || "Checking camera file list...";
+        } else if (cc.state === "paused") {
+          msgEl.style.color = "var(--warn)";
+          msgEl.textContent = `Paused: ${cc.reason || "waiting"}`;
+        } else {
+          msgEl.style.color = "var(--accent)";
+          msgEl.textContent = `Copying ${fDone} / ${fTot} files`;
+        }
+        const mbDone = (bDone / 1e6).toFixed(1), mbTot = (bTot / 1e6).toFixed(1);
+        const spd = (cc.mb_per_s || 0).toFixed(1);
+        const eta = cc.eta_s != null ? fmtDur(cc.eta_s) : "--:--";
+        const cur = cc.current_file ? ` · ${cc.current_file}` : "";
+        $("cc-meta").textContent = `${fDone}/${fTot} files · ${mbDone} / ${mbTot} MB · ${spd} MB/s · ETA ${eta}${cur}`;
+        return;
+      }
+      if (box.dataset.mode !== "idle") {
+        box.dataset.mode = "idle";
+        box.innerHTML = `<button class="huge ghost" id="cc-start"><span>COPY CAMERA IMAGES TO PI</span></button>` +
+          `<div class="note" id="cc-reason" style="display:none"></div>` +
+          `<div class="msgline" id="cc-result" style="display:none"></div>`;
+        $("cc-start").onclick = startCameraCopy;
+      }
+      const blocked = cc.blocked_reason || "";
+      const canStart = cc.can_start !== false && !blocked && !ccBusy;
+      $("cc-start").disabled = !canStart;
+      const reasonEl = $("cc-reason");
+      if (blocked) {
+        reasonEl.style.display = "";
+        reasonEl.textContent = `Unavailable: ${blocked}`;
+      } else if (ccError) {
+        reasonEl.style.display = "";
+        reasonEl.textContent = ccError;
+      } else {
+        reasonEl.style.display = "none";
+      }
+      const resEl = $("cc-result");
+      if ((cc.state === "done" || cc.state === "failed" || cc.state === "cancelled") && cc.message) {
+        resEl.style.display = "";
+        resEl.textContent = cc.message;
+        resEl.style.color = cc.state === "done" ? "var(--ok)" : (cc.state === "failed" ? "var(--warn)" : "var(--muted)");
+      } else {
+        resEl.style.display = "none";
       }
     }
     function renderSurveyPill(d) {
@@ -901,6 +967,7 @@
       const key = `idle:${L ? L.id : ""}:${sv.message}:${reachAvail ? 1 : 0}`;
       if (body.dataset.key === key && $("sv-start")) {
         if (reachAvail) updateReachLine($("sv-reach"), d);
+        updateCameraCopy($("sv-camcopy"), d);
         return;      // don't wipe what she's typing or checkbox state
       }
       body.dataset.key = key;
@@ -916,6 +983,7 @@
         reachHtml +
         `<input id="sv-name" placeholder="Name (optional), e.g. Leg 3 ice shelf" style="background:var(--panel);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:12px;font:inherit;font-size:16px" />` +
         `<button class="huge go" id="sv-start"><span>START SURVEY</span></button>` + lastHtml +
+        `<div class="sect">CAMERA IMAGES</div><div id="sv-camcopy" style="display:flex;flex-direction:column;gap:8px"></div>` +
         `<div class="sect">POWER</div><button class="huge ghost" id="sv-off"><div class="fill"></div><span>HOLD TO SHUT DOWN SAFELY</span></button>` +
         `<div class="note">Stops any survey, parks the camera's card, saves everything, then powers off the Pi. Switch the power off when its green LED stops.</div>`;
       if (reachAvail) {
@@ -924,6 +992,7 @@
         $("sv-start").disabled = true;
         $("sv-reach-ok").onchange = () => { $("sv-start").disabled = !$("sv-reach-ok").checked; };
       }
+      updateCameraCopy($("sv-camcopy"), d);
       $("sv-start").onclick = () => startSurvey(false);
       holdButton("sv-off", 2000, shutdownPi);
     }
@@ -982,6 +1051,30 @@
         if (last) last._shutdown = data;
       } catch {}
       $("sv-body").dataset.key = ""; renderSheet(last || {});
+    }
+    async function startCameraCopy() {
+      ccBusy = true; ccError = "";
+      if ($("cc-start")) $("cc-start").disabled = true;
+      try {
+        const r = await fetch("/api/camera/copy/start", { method: "POST" });
+        const data = await r.json();
+        if (!data.ok && data.error) ccError = data.error;
+        if (last && data.status) last._camera_copy = data.status;
+      } catch {
+        ccError = "Could not reach the Pi.";
+      } finally {
+        ccBusy = false;
+        if ($("sheet").classList.contains("open")) renderSheet(last || {});
+      }
+    }
+    async function cancelCameraCopy() {
+      ccError = "";
+      try {
+        const r = await fetch("/api/camera/copy/cancel", { method: "POST" });
+        const data = await r.json();
+        if (last && data.status) last._camera_copy = data.status;
+      } catch {}
+      if ($("sheet").classList.contains("open")) renderSheet(last || {});
     }
     $("p-survey").onclick = () => { $("sheet").classList.add("open"); $("sv-body").innerHTML = ""; $("sv-body").dataset.key = ""; renderSheet(last || {}); };
     $("sv-close").onclick = () => { $("sheet").classList.remove("open"); svPending = null; };

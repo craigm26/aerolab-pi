@@ -50,8 +50,13 @@ logging:
   log_hz: 5                 # display-rate summary; every laser reading and GNSS fix is logged separately
   mirror_dirs: []           # extra disks that also get the raw sensor capture, e.g. ["/mnt/usb2/aerolab_mirror"]
 
+# camera:                   # added by ./configure.sh when a self-capturing camera (e.g. RedEdge-P) is chosen
+#   reserve_gb: 2           # free space kept in reserve on the log disk when copying camera images (default 2 GB)
+
 timing:
   pps_device: ""            # "pps0" when the GNSS PPS is wired to a GPIO with the pps-rp1 / pps-gpio overlay
+  set_clock: false          # true = feed GNSS time to chrony so the Pi keeps UTC without internet
+  chrony_socket: "/run/chrony/aerolab.sock"
 
 hud:
   low_agl_warn_ft: 200      # AGL readout turns amber below this

@@ -1,6 +1,6 @@
 # Next steps before hardware testing
 
-Work for the snow-survey installation. Items 1-4 are built and tested in simulation; what still needs the real hardware is marked **On the bench**.
+Work for the snow-survey installation. Items 1-4 and GNSS/PPS system clock sync via chrony (`daemon/timesync.py`, `install.sh`) are built and tested in simulation; what still needs the real hardware is marked **On the bench**.
 
 ## 1. Readiness check: is the Reach M2's own raw log running? (built)
 
@@ -24,12 +24,12 @@ Shutdown becomes two phases:
   3. Ask the camera to park its card, and wait for it to confirm.
 - **Review:** if everything passed, hold to power off. If anything failed, it stops and names the failure, for example "Backup to /mnt/usb2 failed: not mounted" or "Camera did not confirm its card is parked". Options: Retry, Shut down anyway (a longer hold, logged), or Cancel.
 
-## 3. Camera images (built: image list)
+## 3. Camera images (built)
 
 The RedEdge-P keeps its images on its own card, and they are backed up separately.
 
 - **(a) Image list** (built): at STOP, the Pi saves the camera's file list (name, size, time, via the documented `/files` API) into the survey package. A check tool compares a separate backup of the card against that list, so a missing or truncated image shows up.
-- **(b) Image copy** (later): after landing, on ground power, copy the images to the Pi's SSD over Ethernet. They are large, so this is slow, and it must never run in flight. Deferred; until then the camera card is backed up separately and checked with `tools/check_camera_backup.py`.
+- **(b) Image copy** (built): `daemon/camera_copy.py` copies the camera's `/files` tree over Ethernet into `<log_dir>/camera_images/<YYYYMMDD_HHMMSS>/` after landing, triggered from **COPY CAMERA IMAGES TO PI** in the survey sheet. It streams files to `.part` before renaming on exact size match, retries mismatches up to 3 times, skips already-completed files on resume, writes `MANIFEST.sha256` and `copy_report.json`, checks for 2 GB of reserve disk space, and refuses or pauses automatically while a survey is running or the aircraft is moving. **On the bench:** test copy throughput and resume against the real RedEdge-P over Ethernet.
 
 ## 4. Install test before the first real install (built: dry run)
 

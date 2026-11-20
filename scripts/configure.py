@@ -242,6 +242,9 @@ def build_config(base: dict, answers: dict, catalog: dict | None = None) -> dict
         t = cfg.setdefault("timing", {})
         t["pps_pin"] = int(answers["pps.pin"]) if answers["pps.pin"] else None
         t["pps_device"] = "pps0" if answers["pps.pin"] else ""
+    if "timing.set_clock" in answers:
+        t = cfg.setdefault("timing", {})
+        t["set_clock"] = bool(answers["timing.set_clock"])
     if "mirror_dirs" in answers:
         cfg["logging"]["mirror_dirs"] = list(answers["mirror_dirs"])
     if "ssd.mount" in answers:
@@ -594,6 +597,14 @@ def interview(ui, base: dict, catalog: dict | None = None) -> tuple[dict, dict]:
                                default=str((base.get("timing") or {}).get("pps_pin", 18)))
     else:
         a["pps.pin"] = ""
+    if mode == "live":
+        a["timing.set_clock"] = ui.yesno(
+            "Set the Pi's clock from GNSS (chrony)?\n\n"
+            "Feeds GNSS time (and PPS, if wired) into chrony so the Pi keeps accurate UTC without internet.",
+            default_yes=True,
+        )
+    else:
+        a["timing.set_clock"] = False
 
     # Logging and display
     mount = str(Path(base["logging"]["primary_dir"]).parent)
@@ -695,13 +706,15 @@ def print_catalog(catalog: dict):
 
 
 def needs_extras(cfg: dict) -> list[str]:
-    """Things install.sh must add for this config: 'pymavlink', 'ollama:<model>'."""
+    """Things install.sh must add for this config: 'pymavlink', 'pps:<pin>', 'chrony', 'ollama:<model>'."""
     out = []
     if any((cfg.get(s) or {}).get("driver") == "mavlink" for s in ("gnss", "imu_ahrs")):
         out.append("pymavlink")
     t = cfg.get("timing") or {}
     if t.get("pps_device") and t.get("pps_pin") is not None:
         out.append(f"pps:{t['pps_pin']}")
+    if t.get("set_clock"):
+        out.append("chrony")
     b = cfg.get("buddy") or {}
     if b.get("ai") and b.get("model"):
         out.append(f"ollama:{b['model']}")

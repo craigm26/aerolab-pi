@@ -34,11 +34,13 @@ import calibration as calib  # noqa: E402
 import drivers  # noqa: E402
 import integrity as integ  # noqa: E402
 import camera as camera_mod  # noqa: E402
+import camera_copy as camera_copy_mod  # noqa: E402
 import diagnose  # noqa: E402
 import ppsclock  # noqa: E402
 import rawlog  # noqa: E402
 import reach as reach_mod  # noqa: E402
 import survey as survey_mod  # noqa: E402
+import timesync  # noqa: E402
 from supervise import Supervisor, watchdog  # noqa: E402
 
 # gpiozero works on every Pi model including the Pi 5 (RPi.GPIO does not).
@@ -259,6 +261,12 @@ class AeroLabDaemon:
         self.pps = ppsclock.PPSClock(tcfg.get("pps_device") if not sim_mode else None,
                                      on_edge=lambda seq, a, off: self.readings.add(
                                          "pps", (self.state.flight_id, seq, a, a - off, off)))
+        set_clock = bool(tcfg.get("set_clock", False))
+        sock_path = str(tcfg.get("chrony_socket") or timesync.DEFAULT_SOCKET)
+        self.chrony_feeder = timesync.ChronyFeeder(sock_path) if (set_clock and not sim_mode) else None
+        self.timesync = timesync.ChronySync(enabled=set_clock, sim=sim_mode)
+        self.last_gnss_date: str | None = None
+        self._last_gnss_tod: float | None = None
         reach_url = str((cfg.get("gnss") or {}).get("reach_url") or "").strip()
         self.reach = reach_mod.ReachLog(reach_url, sim=sim_mode)
         self._data_errors: dict[str, float] = {}
@@ -290,6 +298,7 @@ class AeroLabDaemon:
         self.ai_status: dict = {"available": False, "reason": "checking"}
         self.new_flight("boot")
         self.survey = survey_mod.SurveyManager(self)
+        self.camera_copy = camera_copy_mod.CameraCopier(self)
         self.shutdown_state: dict = {"state": "running"}
 
     @classmethod
@@ -391,6 +400,17 @@ class AeroLabDaemon:
         if usable or not missing:
             sync_steps += await asyncio.to_thread(survey_mod.final_sync, self.db_path, self.log_dir, usable)
         steps.extend(sync_steps)
+        if self.camera_copy.in_progress():
+            cc_st = self.camera_copy.status()
+            steps.append({
+                "step": "Camera image copy",
+                "ok": False,
+                "detail": (
+                    f"camera image copy in progress: {cc_st['files_done']} of {cc_st['files_total']} files; "
+                    "it resumes next time"
+                ),
+                "severity": "warn",
+            })
         cam = self.camera
         cc = self.cfg.get("camera") or {}
         if cam.enabled:
@@ -651,6 +671,17 @@ class AeroLabDaemon:
             if "hdop" in r:
                 s.hdop = round(float(r["hdop"]), 2)
             self.last_seen["gnss"] = now
+        if r.get("gnss_date"):
+            self.last_gnss_date = str(r["gnss_date"])
+        if "gnss_tod" in r:
+            tod = float(r["gnss_tod"])
+            if (not r.get("gnss_date") and self.last_gnss_date and self._last_gnss_tod is not None
+                    and (self._last_gnss_tod - tod) > 43200.0):
+                self.last_gnss_date = timesync.next_date(self.last_gnss_date)
+            self._last_gnss_tod = tod
+            if self.chrony_feeder is not None and r.get("fix", 1) > 0:
+                gnss_epoch = timesync.gnss_utc(tod, self.last_gnss_date, now)
+                self.chrony_feeder.send(now, gnss_epoch)
         if "gs_ms" in r:
             s.gs_ms = round(float(r["gs_ms"]), 2)
             if "track_deg" in r:
@@ -1092,6 +1123,15 @@ class AeroLabDaemon:
         if self.pps.enabled:
             st = self.pps.status()
             items.append({"item": "GNSS PPS timing", "status": "ok" if st["ok"] else "warn", "detail": st["detail"]})
+        if self.timesync.enabled:
+            tst = self.timesync.status()
+            if tst["synced"]:
+                off_txt = f" ({tst['offset_ms']:+.3f} ms)" if tst["offset_ms"] is not None else ""
+                items.append({"item": "System clock", "status": "ok",
+                              "detail": f"synced to {tst['source'] or 'chrony'}{off_txt}"})
+            else:
+                items.append({"item": "System clock", "status": "warn",
+                              "detail": tst["detail"] or "not synced"})
         rst = self.reach.status()
         if not rst["enabled"]:
             items.append({"item": "Reach raw log", "status": "warn",
@@ -1296,7 +1336,9 @@ table{{border-collapse:collapse;width:100%}}td,th{{border-bottom:1px solid #eee;
         d["_data"] = self.data_status()
         d["_ready"] = self.ready
         d["_camera"] = self.camera.snapshot()
+        d["_camera_copy"] = self.camera_copy.status()
         d["_reach"] = self.reach.status()
+        d["_timesync"] = self.timesync.status()
         d["_survey"] = self.survey.status()
         d["_shutdown"] = self.shutdown_state
         return json.dumps(d)
@@ -1350,9 +1392,11 @@ table{{border-collapse:collapse;width:100%}}td,th{{border-bottom:1px solid #eee;
             sup.run("reading log", self.readings.run),
             sup.run("clock", self.clock_loop, stall_s=20),
             *( [sup.run("pps", self.pps.run)] if self.pps.enabled else [] ),
+            *( [sup.run("timesync", self.timesync.run)] if self.timesync.enabled else [] ),
             *( [sup.run("camera", self.camera.sim_loop)] if self.camera.enabled and self.sim_mode else [] ),
             *( [sup.run("camera status", self.camera.status_loop)]
                if self.camera.enabled and self.camera.status_url and not self.sim_mode else [] ),
+            sup.run("camera copy", self.camera_copy.run),
             *( [sup.run("reach log", self.reach.run)] if self.reach.enabled else [] ),
             sup.run("buddy", self.buddy_loop, stall_s=60),
             sup.run("broadcast", self.broadcast_loop, stall_s=30),
@@ -1369,6 +1413,8 @@ table{{border-collapse:collapse;width:100%}}td,th{{border-bottom:1px solid #eee;
         for w in self.raw.values():
             w.close()
         self.camera.stop()
+        if self.chrony_feeder is not None:
+            self.chrony_feeder.close()
         # final flush of queued readings
         try:
             conn = sqlite3.connect(self.db_path)
@@ -1431,6 +1477,21 @@ def create_app(daemon: AeroLabDaemon) -> FastAPI:
     @app.post("/api/survey/stop")
     async def survey_stop():
         return JSONResponse(await daemon.survey.stop(), headers={"cache-control": "no-store"})
+
+    @app.get("/api/camera/copy")
+    async def camera_copy_status():
+        return JSONResponse(daemon.camera_copy.status())
+
+    @app.post("/api/camera/copy/start")
+    async def camera_copy_start():
+        return JSONResponse(await daemon.camera_copy.start())
+
+    @app.post("/api/camera/copy/cancel")
+    async def camera_copy_cancel():
+        res = daemon.camera_copy.cancel()
+        await daemon.camera_copy.wait_stopped(timeout=2.0)
+        res["status"] = daemon.camera_copy.status()
+        return JSONResponse(res)
 
     @app.post("/api/shutdown/prepare")
     async def shutdown_prepare():

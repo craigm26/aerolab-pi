@@ -75,7 +75,18 @@ ls /sys/class/pps/          # pps0 should be listed
 sudo ppstest /dev/pps0      # one line a second, once the Reach has a fix
 ```
 
-**3c. Timing validation.** Leave it running for 10 minutes with a fix, then:
+**3c. Chrony clock sync check** (when "Set the Pi's clock from GNSS (chrony)?" was answered yes in `./configure.sh`):
+
+```bash
+chronyc sources
+chronyc -n tracking
+```
+
+Good:
+- `chronyc sources` lists `GNSS` (and `PPS` when PPS is wired) with non-zero `Reach` (climbing toward `377`). With PPS wired, `#* PPS` is selected and `#? GNSS` (marked `noselect`) feeds it the whole second; without PPS, `#* GNSS` is selected.
+- `chronyc -n tracking` shows `Stratum : 1`, `Reference ID` as `PPS` (or `GNSS`), `Leap status : Normal`, and `System time` offset within microseconds (PPS) or tens of milliseconds (GNSS only).
+
+**3d. Timing validation.** Leave it running for 10 minutes with a fix, then:
 
 ```bash
 python tools/timing_check.py

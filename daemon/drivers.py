@@ -8,6 +8,7 @@ the same shape: feed(bytes) -> list[dict]. A reading may carry any of:
     roll, pitch, yaw                 attitude, degrees
     lat, lon, alt_msl, fix, sats     position (fix: 0 none, 1 GPS, 2 DGPS, 4 RTK fixed, 5 RTK float)
     gnss_tod                         GNSS UTC time of day, seconds since midnight
+    gnss_date                        GNSS UTC calendar date, YYYY-MM-DD (from RMC or ZDA)
 
 One device can produce several kinds (a GNSS/INS gives position and attitude),
 and the daemon applies whatever arrives. Pick a driver per sensor in the
@@ -18,6 +19,7 @@ from __future__ import annotations
 
 import math
 import struct
+from datetime import date
 from typing import Callable
 
 import pynmea2
@@ -95,7 +97,7 @@ def _nmea_checksum_ok(text: str) -> bool:
 
 
 def parse_nmea(text: str) -> Reading | None:
-    """GGA (position, fix, sats, time) and HDT/PASHR (heading/attitude) from any talker."""
+    """GGA (position, fix, sats, time), RMC (speed, track, date), ZDA (time, date), VTG, HDT/PASHR."""
     if not text.startswith("$"):
         return None
     if text[3:6] == "SHR" or text.startswith("$PASHR"):
@@ -125,12 +127,27 @@ def parse_nmea(text: str) -> Reading | None:
             return None
     if st == "RMC":
         try:
-            if msg.status != "A" or msg.spd_over_grnd in (None, ""):
+            if msg.status != "A":
                 return None
-            r = {"gs_ms": float(msg.spd_over_grnd) * 0.514444}
+            r = {}
+            if msg.spd_over_grnd not in (None, ""):
+                r["gs_ms"] = float(msg.spd_over_grnd) * 0.514444
             if msg.true_course not in (None, ""):
                 r["track_deg"] = float(msg.true_course) % 360.0
-            return r
+            if getattr(msg, "datestamp", None):
+                r["gnss_date"] = msg.datestamp.isoformat()
+            return r or None
+        except (ValueError, TypeError, AttributeError):
+            return None
+    if st == "ZDA":
+        try:
+            r = {}
+            if msg.timestamp:
+                t = msg.timestamp
+                r["gnss_tod"] = t.hour * 3600 + t.minute * 60 + t.second + t.microsecond / 1e6
+            if msg.year and msg.month and msg.day:
+                r["gnss_date"] = date(int(msg.year), int(msg.month), int(msg.day)).isoformat()
+            return r or None
         except (ValueError, TypeError, AttributeError):
             return None
     if st == "VTG":
