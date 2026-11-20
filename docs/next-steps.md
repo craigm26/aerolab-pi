@@ -29,7 +29,7 @@ Shutdown becomes two phases:
 The RedEdge-P keeps its images on its own card, and they are backed up separately.
 
 - **(a) Image list** (built): at STOP, the Pi saves the camera's file list (name, size, time, via the documented `/files` API) into the survey package. A check tool compares a separate backup of the card against that list, so a missing or truncated image shows up.
-- **(b) Image copy** (optional, **Decision**): after landing, on ground power, copy the images to the Pi's SSD over Ethernet. They are large, so this is slow, and it must never run in flight.
+- **(b) Image copy** (later): after landing, on ground power, copy the images to the Pi's SSD over Ethernet. They are large, so this is slow, and it must never run in flight. Deferred; until then the camera card is backed up separately and checked with `tools/check_camera_backup.py`.
 
 ## 4. Install test before the first real install (built: dry run)
 
