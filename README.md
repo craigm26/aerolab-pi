@@ -8,7 +8,7 @@ The Pi reads the sensors, works out height above ground corrected for bank and p
 
 *Startup: the display checks each sensor off as its data arrives, then hands over. Recorded from simulation mode.*
 
-**Demo video (2 min 39 s):** [docs/aerolab-demo.mp4](docs/aerolab-demo.mp4). Setup, boot self-test, ground calibration, flight, callouts, Buddy and the accuracy results, all recorded from the running code in simulation mode.
+**Demo video (2 min 59 s):** [docs/aerolab-demo.mp4](docs/aerolab-demo.mp4). Setup, boot self-test, ground calibration, flight, callouts and Buddy, plus survey readiness, recording confirmation, verified saving, camera image copy availability, shutdown review and GNSS clock setup. The HUD runs in simulation; the accuracy card uses saved virtual-flight results.
 
 [![Demo video](docs/images/demo_poster.jpg)](docs/aerolab-demo.mp4)
 
