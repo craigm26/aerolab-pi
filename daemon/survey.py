@@ -18,8 +18,10 @@ things that need running:
             and a manifest with a SHA-256 for every file
          4. copies the package to every backup drive and verifies each copy
 
-The Reach M2's own raw log has no documented remote control: set it to start
-logging on power-up in Emlid Flow. The Pi confirms the GNSS stream.
+The Reach M2's own raw log has no official remote control: set Autostart in
+Emlid Flow so it records on power-up. When gnss.reach_url is configured and
+reachable, the survey confirms that the Reach raw log is writing and growing;
+otherwise START requires manual confirmation from the pilot.
 """
 
 from __future__ import annotations
@@ -119,14 +121,27 @@ class SurveyManager:
         fs = diagnose.findings(self.d, self.d.catalog)
         return {"verdict": diagnose.readiness(fs), "findings": fs}
 
-    async def start(self, name: str = "", force: bool = False) -> dict:
+    async def start(self, name: str = "", force: bool = False, reach_confirmed: bool = False) -> dict:
         if self.state in ("starting", "recording"):
             return {"ok": False, "error": f"a survey is already {self.state}"}
+        reach = getattr(self.d, "reach", None)
+        rst = reach.status() if reach is not None else {"enabled": False, "reachable": False}
+        reach_auto = bool(rst.get("enabled") and rst.get("reachable"))
+        if not reach_auto and not reach_confirmed:
+            return {
+                "ok": False,
+                "needs_reach_confirmation": True,
+                "detail": "Reach raw logging is not checked automatically: confirm it is recording in Emlid Flow before starting.",
+            }
         rd = self.readiness()
         if rd["verdict"]["level"] == "red" and not force:
             return {"ok": False, "needs_confirmation": True, "readiness": rd}
         self.state = "starting"
         utc, mono = time.time_ns(), time.monotonic_ns()
+        reach_manual_note = None
+        if not reach_auto and reach_confirmed:
+            utc_str = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(utc / 1e9))
+            reach_manual_note = f"Reach raw log: confirmed manually by the pilot at {utc_str}"
         conn = sqlite3.connect(self.d.db_path)
         conn.executescript(SURVEY_SCHEMA)
         cur = conn.execute("INSERT INTO surveys (flight_id, name, start_utc_ns, start_mono_ns, readiness) "
@@ -137,7 +152,8 @@ class SurveyManager:
         conn.close()
         name = name or f"Survey {sid}"
         self.current = {"id": sid, "name": name, "start_utc_ns": utc, "start_mono_ns": mono,
-                        "counts_start": self.counts(), "readiness": rd["verdict"], "forced": force}
+                        "counts_start": self.counts(), "readiness": rd["verdict"], "forced": force,
+                        "reach_manual_confirmation": reach_manual_note}
         self.current["camera_command"] = await self.camera_capture(True)
         self.d.buddy.emit("info", f"{name} started" + (" (readiness overridden)" if force and
                                                        rd["verdict"]["level"] == "red" else ""))
@@ -200,6 +216,21 @@ class SurveyManager:
         if not d.sim_mode and d.raw:
             n = c1["raw_bytes"] - c0["raw_bytes"]
             add("Raw capture", n > 0, f"{n:,} bytes" if n else "no raw bytes since start")
+        reach = getattr(d, "reach", None)
+        if cur.get("reach_manual_confirmation"):
+            add("Reach raw log", True, cur["reach_manual_confirmation"])
+        elif reach is not None:
+            rst = reach.status()
+            if rst.get("enabled") and rst.get("reachable"):
+                ok = bool(rst.get("writing") and rst.get("growing"))
+                if ok:
+                    mb = (rst.get("size") or 0) / 1e6
+                    detail = f"writing {rst.get('file_name') or 'raw log'} ({mb:.1f} MB)"
+                elif rst.get("writing"):
+                    detail = f"writing {rst.get('file_name') or 'raw log'}, waiting for size to grow"
+                else:
+                    detail = "Reach is NOT logging raw data"
+                add("Reach raw log", ok, detail)
         return items
 
     # -- stop ------------------------------------------------------------------------
@@ -222,6 +253,8 @@ class SurveyManager:
                    "raw_bytes": c1["raw_bytes"] - c0["raw_bytes"], "readings_lost": c1["dropped"] - c0["dropped"],
                    "readiness_at_start": cur["readiness"], "confirmation": cur.get("confirmation"),
                    "camera_start": cur.get("camera_command"), "camera_stop": cam, "forced": cur.get("forced")}
+        if cur.get("reach_manual_confirmation"):
+            summary["reach_confirmation"] = cur["reach_manual_confirmation"]
         conn = sqlite3.connect(self.d.db_path)
         conn.execute("UPDATE surveys SET stop_utc_ns=?, stop_mono_ns=?, summary=? WHERE id=?",
                      (utc, mono, json.dumps(summary), cur["id"]))
@@ -284,6 +317,27 @@ class SurveyManager:
             conn.close()
             (pkg / "camera_status.jsonl").write_text("".join(json.dumps({"utc_ns": u, **json.loads(st)}) + "\n"
                                                              for u, st in rows))
+            fetched_utc = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            if d.sim_mode:
+                cam_files = {
+                    "fetched_utc": fetched_utc,
+                    "base_url": d.camera.base_url(),
+                    "files": [],
+                    "error": None,
+                    "note": "simulation: no camera",
+                }
+                (pkg / "camera_files.json").write_text(json.dumps(cam_files, indent=2) + "\n")
+                notes["camera_files"] = "simulation: no camera"
+            elif d.camera.status_url:
+                cam_list, cam_err = d.camera.list_files_sync()
+                cam_files = {
+                    "fetched_utc": fetched_utc,
+                    "base_url": d.camera.base_url(),
+                    "files": cam_list if cam_list is not None else [],
+                    "error": cam_err,
+                }
+                (pkg / "camera_files.json").write_text(json.dumps(cam_files, indent=2) + "\n")
+                notes["camera_files"] = f"{len(cam_files['files'])} files" + (f" ({cam_err})" if cam_err else "")
         # 3. raw captures that overlap the survey
         raw_dir = d.log_dir / "raw"
         if raw_dir.exists():
@@ -303,7 +357,11 @@ class SurveyManager:
         total = sum(p.stat().st_size for p in files)
         # 5. copy to every backup drive and verify
         copies = [{"dir": str(pkg), "verified": verify(pkg)}]
-        for m in d.mirror_dirs:
+        usable, missing = d.usable_mirrors()
+        for m in missing:
+            copies.append({"dir": str(m), "verified": False,
+                           "error": "backup drive not mounted (not written, so nothing lands on the SD card)"})
+        for m in usable:
             target = Path(m) / "surveys" / pkg.name
             try:
                 if target.exists():
@@ -328,3 +386,60 @@ def verify(pkg: Path) -> bool:
         if not p.exists() or sha256(p) != h:
             return False
     return True
+
+
+def final_sync(db_path: Path, log_dir: Path, mirror_dirs: list[Path]) -> list[dict]:
+    """Copy a consistent database snapshot and raw captures to each mirror drive and verify."""
+    if not mirror_dirs:
+        return [{"step": "Final sync", "ok": False, "detail": "no backup drive configured", "severity": "warn"}]
+    stamp = time.strftime("%Y%m%d_%H%M%S", time.gmtime())
+    raw_dir = Path(log_dir) / "raw"
+    steps = []
+    for m in mirror_dirs:
+        mirror = Path(m)
+        target = mirror / "final_sync" / stamp
+        try:
+            if target.exists():
+                shutil.rmtree(target)
+            target.mkdir(parents=True, exist_ok=True)
+            src = sqlite3.connect(db_path, timeout=10)
+            try:
+                dst = sqlite3.connect(target / "aerolab_flight.db")
+                try:
+                    src.backup(dst)
+                finally:
+                    dst.close()
+            finally:
+                src.close()
+            if raw_dir.exists():
+                raw_files = sorted(raw_dir.glob("*.aeroraw"))
+                if raw_files:
+                    (target / "raw").mkdir(exist_ok=True)
+                    for f in raw_files:
+                        shutil.copy2(f, target / "raw" / f.name)
+            files = sorted(p for p in target.rglob("*") if p.is_file() and p.name != "MANIFEST.sha256")
+            lines = [f"{sha256(p)}  {p.relative_to(target)}" for p in files]
+            (target / "MANIFEST.sha256").write_text("\n".join(lines) + "\n")
+            total = sum(p.stat().st_size for p in files)
+            if verify(target):
+                steps.append({
+                    "step": f"Final sync ({mirror})",
+                    "ok": True,
+                    "detail": f"verified {len(files) + 1} files ({total / 1e6:.1f} MB) in {target}",
+                    "severity": "ok",
+                })
+            else:
+                steps.append({
+                    "step": f"Final sync ({mirror})",
+                    "ok": False,
+                    "detail": f"verification failed for {target}",
+                    "severity": "fail",
+                })
+        except (OSError, sqlite3.Error) as exc:
+            steps.append({
+                "step": f"Final sync ({mirror})",
+                "ok": False,
+                "detail": f"backup to {mirror} failed: {exc}",
+                "severity": "fail",
+            })
+    return steps

@@ -170,7 +170,7 @@ It reports "Saved: N files, X MB, verified on 2 of 2 drive(s)".
 
 Switch the power off when the Pi's green LED stops.
 
-**The Reach M2's own raw log** has no remote control. In Emlid Flow, set raw logging to start automatically on power-up. The survey confirms the Reach's NMEA stream, not its internal log.
+**The Reach M2's own raw log** has no official remote control, so turn on **Autostart** in Emlid Flow (`Receivers > Logging > Recorded logs and settings > gear > Autostart`) to log automatically on power-up. If the Reach is on the Pi's network and `gnss.reach_url` is set in `./configure.sh`, AeroLab-Pi runs a read-only check of the Reach's live raw log during self-test, survey confirmation, diagnosis, and safe shutdown (test compatibility on your M2 with `python tools/reach_discover.py http://<reach-ip>`). When that check is disabled or unreachable, START SURVEY requires the pilot to tick a manual confirmation box, which is recorded in the survey confirmation and `survey.json`.
 
 **What the second drive gets:**
 - **Continuously:** raw sensor captures.

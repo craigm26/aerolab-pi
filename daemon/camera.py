@@ -19,10 +19,15 @@ backup and for health, while the Reach time mark is the exact one.
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 import time
+from urllib.parse import quote
 
 STATUS_KEYS = ("sd_gb_free", "sd_gb_total", "sd_status", "sd_warn", "auto_cap_active", "bus_volts",
                "gps_used_sats", "gps_type", "time_source", "utc_time_valid", "dls_status")
+
+DEFAULT_MAX_FILES = 200_000
+DEFAULT_MAX_DIRS = 50_000
 
 
 class Camera:
@@ -96,6 +101,15 @@ class Camera:
         return time.monotonic() - self.last > gap
 
     # -- status over HTTP ----------------------------------------------------
+    def base_url(self) -> str:
+        """Return the camera HTTP base URL (status_url with '/status' removed)."""
+        if not self.status_url:
+            return ""
+        url = self.status_url.rstrip("/")
+        if url.endswith("/status"):
+            return url[:-len("/status")]
+        return url.rsplit("/status", 1)[0].rstrip("/")
+
     async def status_loop(self, period: float = 5.0):
         if not self.status_url:
             return
@@ -111,6 +125,82 @@ class Camera:
                 except Exception as exc:
                     self.status_ok, self.status_error = False, str(exc)[:120]
                 await asyncio.sleep(period)
+
+    async def list_files(
+        self,
+        timeout_s: float = 30.0,
+        req_timeout_s: float = 5.0,
+        max_files: int = DEFAULT_MAX_FILES,
+        max_dirs: int = DEFAULT_MAX_DIRS,
+    ) -> tuple[list[dict] | None, str | None]:
+        """Walk the camera's read-only HTTP /files/ tree and list every file.
+
+        Uses the documented MicaSense RedEdge HTTP API (/files/*): GET on a
+        directory returns JSON with "files" ([{"name", "size"}, ...]) and
+        "directories" (["0000SET", ...]). Never raises; returns (files, None)
+        on success, (files, error) if capped, or (None, error) on failure.
+        """
+        base = self.base_url()
+        if not base:
+            return None, "no status_url configured"
+        try:
+            import httpx
+            files: list[dict] = []
+            visited: set[str] = set()
+            queue: deque[str] = deque([""])
+            deadline = time.monotonic() + timeout_s
+            async with httpx.AsyncClient(follow_redirects=True) as client:
+                while queue:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return None, f"timed out after {timeout_s:g}s"
+                    rel_dir = queue.popleft().strip("/")
+                    if rel_dir in visited:
+                        continue
+                    if len(visited) >= max_dirs:
+                        files.sort(key=lambda f: f["path"])
+                        return files, f"stopped at cap of {max_dirs} directories"
+                    visited.add(rel_dir)
+                    req_path = f"/files/{quote(rel_dir, safe='/')}" if rel_dir else "/files/"
+                    r = await client.get(f"{base}{req_path}", timeout=min(req_timeout_s, remaining))
+                    if r.status_code != 200:
+                        return None, f"HTTP {r.status_code} for {req_path}"
+                    data = r.json()
+                    if not isinstance(data, dict) or ("files" not in data and "directories" not in data):
+                        return None, f"unexpected directory listing for {req_path}"
+                    for entry in data.get("files") or []:
+                        if not isinstance(entry, dict) or not entry.get("name"):
+                            continue
+                        name = str(entry["name"]).lstrip("/")
+                        api_path = f"/files/{rel_dir}/{name}" if rel_dir else f"/files/{name}"
+                        size = entry.get("size")
+                        item: dict = {"path": api_path, "size": int(size) if size is not None else None}
+                        if "mtime" in entry and entry["mtime"] is not None:
+                            item["mtime"] = entry["mtime"]
+                        files.append(item)
+                        if len(files) >= max_files:
+                            files.sort(key=lambda f: f["path"])
+                            return files, f"stopped at cap of {max_files} files"
+                    for sub in data.get("directories") or []:
+                        sub_name = str(sub["name"] if isinstance(sub, dict) else sub).strip("/")
+                        if not sub_name or ".." in sub_name.split("/") or sub_name == ".":
+                            continue
+                        child = f"{rel_dir}/{sub_name}" if rel_dir else sub_name
+                        if child not in visited:
+                            queue.append(child)
+            files.sort(key=lambda f: f["path"])
+            return files, None
+        except Exception as exc:
+            msg = str(exc).strip() or type(exc).__name__
+            return None, msg[:200]
+
+    def list_files_sync(self, **kwargs) -> tuple[list[dict] | None, str | None]:
+        """Synchronous wrapper around list_files() for worker threads."""
+        try:
+            return asyncio.run(self.list_files(**kwargs))
+        except Exception as exc:
+            msg = str(exc).strip() or type(exc).__name__
+            return None, msg[:200]
 
     async def sim_loop(self):
         """Simulated camera: exposures at the expected rate, plausible status."""

@@ -1,8 +1,12 @@
 # Next steps before hardware testing
 
-Planned work for the snow-survey installation, in order. Nothing here is built yet; decisions still open are marked **Decision**.
+Work for the snow-survey installation. Items 1-4 are built and tested in simulation; what still needs the real hardware is marked **On the bench**.
 
-## 1. Readiness check: is the Reach M2's own raw log running?
+## 1. Readiness check: is the Reach M2's own raw log running? (built)
+
+Built: `daemon/reach.py` reads the Reach's live `active_logs` status (read-only) over its local web interface, as documented by the open-source home-assistant-emlid project. It shows the result in four places: the self-test, the survey confirmation, Buddy's Checks, and shutdown. When the Reach can't be reached, START asks for a manual tick instead. **On the bench:** run `python tools/reach_discover.py http://<reach-ip>` once, because that interface was verified on Reach RS3/RS4 firmware 35, not yet on an M2.
+
+Original plan:
 
 Emlid doesn't document a way to ask the Reach whether it is logging. Emlid Flow talks to the Reach over a private local API that can change between firmware versions. So, in three layers:
 
@@ -10,7 +14,7 @@ Emlid doesn't document a way to ask the Reach whether it is logging. Emlid Flow 
 2. **Discovery tool.** `tools/reach_discover.py` asks the Reach a short list of status questions over the local network, read-only, and saves the answers. Run it on the bench with the Reach on the Pi's network, so support is built against the real firmware rather than a guess.
 3. **Fallback that always works.** START SURVEY gets a required tick: "Reach raw logging confirmed in Emlid Flow". It is recorded with the survey. If step 2 finds a usable status, the tick becomes an automatic check, and the manual tick stays as a backup.
 
-## 2. Shutdown blocks on problems
+## 2. Shutdown blocks on problems (built)
 
 Shutdown becomes two phases:
 
@@ -20,14 +24,16 @@ Shutdown becomes two phases:
   3. Ask the camera to park its card, and wait for it to confirm.
 - **Review:** if everything passed, hold to power off. If anything failed, it stops and names the failure, for example "Backup to /mnt/usb2 failed: not mounted" or "Camera did not confirm its card is parked". Options: Retry, Shut down anyway (a longer hold, logged), or Cancel.
 
-## 3. Camera images
+## 3. Camera images (built: image list)
 
 The RedEdge-P keeps its images on its own card, and they are backed up separately.
 
-- **(a) Image list** (planned): at STOP, the Pi saves the camera's file list (name, size, time, via the documented `/files` API) into the survey package. A check tool compares a separate backup of the card against that list, so a missing or truncated image shows up.
+- **(a) Image list** (built): at STOP, the Pi saves the camera's file list (name, size, time, via the documented `/files` API) into the survey package. A check tool compares a separate backup of the card against that list, so a missing or truncated image shows up.
 - **(b) Image copy** (optional, **Decision**): after landing, on ground power, copy the images to the Pi's SSD over Ethernet. They are large, so this is slow, and it must never run in flight.
 
-## 4. Install test before the first real install
+## 4. Install test before the first real install (built: dry run)
+
+Built: `./install.sh --dry-run [--defaults|--sim]` prints every system change without making it. The first real install is still the first test on a clean Raspberry Pi OS image.
 
 `install.sh` changes system settings (serial console, sudoers, udev, boot overlays) and hasn't yet run on a clean Raspberry Pi OS image. **Decision:**
 - **Full test:** run the whole install plus the simulator on a freshly flashed spare Pi 5 / SD card;

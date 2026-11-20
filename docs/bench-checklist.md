@@ -45,7 +45,7 @@ Good: `laser_check` bias within ±0.15 m (the laser is rated 10 cm), noise under
 
 **2a. Settings in Emlid Flow:**
 - **Position output:** Serial (UART), NMEA, 10 Hz, 115200 baud.
-- **Raw data logging:** on, UBX or RINEX, 10 Hz, and **start automatically when powered**. That way the Reach logs the moment the instruments are switched on. AeroLab-Pi can't switch the Reach's internal logging on or off.
+- **Raw data logging:** on, UBX or RINEX, 10 Hz, with **Autostart** enabled (`Receivers > Logging > Recorded logs and settings > gear > Autostart`). That way the Reach logs the moment the instruments are switched on. AeroLab-Pi cannot switch the Reach's internal logging on or off. Before cutting power to the Reach, stop logging in Emlid Flow (or let Autostart's shutdown finish) so the active log is compressed and complete.
 
 **2b. Wiring.** Make these connections:
 - Reach S1 pin 4 (TX) → Pi pin 10;
@@ -54,7 +54,15 @@ Good: `laser_check` bias within ±0.15 m (the laser is rated 10 cm), noise under
 
 All of it is 3.3 V, so no adapter is needed.
 
-**2c. Check.** In the cockpit display, the GNSS pill shows a satellite count, and Buddy → Checks shows the Reach at about 10 Hz with 0% bad frames.
+**2c. Serial check.** In the cockpit display, the GNSS pill shows a satellite count, and Buddy → Checks shows the Reach at about 10 Hz with 0% bad frames.
+
+**2d. Raw-log network check (optional).** If the Reach and Pi share a Wi-Fi network (or the Pi joins the Reach hotspot at `http://192.168.42.1`), verify the read-only local interface on the bench:
+
+```bash
+python tools/reach_discover.py http://<reach-ip>
+```
+
+Send the `reach_discovery_*.json` file it writes. Look for `active_logs seen: True` and `raw.is_writing: True` in the summary. If that works on your M2 firmware, enter `http://<reach-ip>` as the Reach address in `./configure.sh` (`gnss.reach_url`) so the boot self-test, survey confirmation, diagnosis and shutdown review check it automatically. Without a Reach network URL (or when unreachable), START SURVEY asks you to tick the manual confirmation box after checking Emlid Flow.
 
 ## 3. PPS timing
 

@@ -148,8 +148,9 @@
     #sheet.open { display: flex; }
     .sheet-card { width: min(640px, 100%); max-height: 100%; overflow-y: auto; background: #0b0e12; border: 1px solid var(--border); border-radius: 14px; padding: 18px; display: flex; flex-direction: column; gap: 12px; }
     .sheet-title { font-weight: 900; letter-spacing: 3px; color: var(--accent); display: flex; justify-content: space-between; align-items: center; }
-    .huge { width: 100%; border: none; border-radius: 12px; padding: 22px 12px; font-size: 1.5rem; font-weight: 900; letter-spacing: 2px; position: relative; overflow: hidden; color: #000; }
+    .huge { width: 100%; border: none; border-radius: 12px; padding: 22px 12px; font-size: 1.5rem; font-weight: 900; letter-spacing: 2px; position: relative; overflow: hidden; color: #000; touch-action: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
     .huge.go { background: var(--ok); } .huge.stop { background: var(--err); color: #fff; } .huge.amber { background: var(--warn); }
+    .huge:disabled { opacity: 0.4; cursor: not-allowed; }
     .huge.ghost { background: var(--panel); color: var(--muted); border: 1px solid var(--border); font-size: 1rem; padding: 14px; }
     .huge .fill { position: absolute; left: 0; top: 0; bottom: 0; width: 0; background: rgba(255,255,255,0.35); }
     .huge span { position: relative; }
@@ -158,7 +159,7 @@
     .count b { display: block; font-size: 1.5rem; } .count span { color: var(--muted); font-size: 0.72rem; letter-spacing: 1px; }
     .elapsed { font-size: 2.6rem; font-weight: 900; text-align: center; font-variant-numeric: tabular-nums; }
     .conf { display: flex; flex-direction: column; gap: 4px; font-size: 0.85rem; }
-    .conf .y { color: var(--ok); } .conf .n { color: var(--err); }
+    .conf .y { color: var(--ok); } .conf .w { color: var(--warn); } .conf .n { color: var(--err); }
     .msgline { padding: 10px; border-radius: 8px; background: var(--panel); font-weight: 700; }
 
     /* ---- boot sequence ---- */
@@ -749,18 +750,55 @@
     /* ------------------------------------------------------------ survey */
     let svPending = null;          // readiness result waiting for "start anyway"
     let svBusy = false;
-    let sdState = null;            // shutdown flow
+    let sdBusy = false;            // shutdown request in flight
     const fmtDur = (s) => { s = Math.max(0, Math.floor(s)); const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), x = s % 60;
       return (h ? h + ":" + String(m).padStart(2, "0") : m) + ":" + String(x).padStart(2, "0"); };
     function holdButton(id, ms, onDone) {
       const el = $(id); if (!el) return;
       const fill = el.querySelector(".fill");
-      let t0 = 0, raf = 0;
-      const tick = () => { const k = Math.min(1, (performance.now() - t0) / ms); fill.style.width = (k * 100) + "%";
-        if (k >= 1) { cancelAnimationFrame(raf); fill.style.width = "0"; onDone(); } else raf = requestAnimationFrame(tick); };
-      const down = (e) => { e.preventDefault(); t0 = performance.now(); raf = requestAnimationFrame(tick); };
-      const up = () => { cancelAnimationFrame(raf); fill.style.width = "0"; };
-      el.addEventListener("pointerdown", down); el.addEventListener("pointerup", up); el.addEventListener("pointerleave", up);
+      let t0 = 0, raf = 0, active = false;
+      const tick = () => {
+        if (!active) return;
+        const k = Math.min(1, (performance.now() - t0) / ms);
+        fill.style.width = (k * 100) + "%";
+        if (k >= 1) { active = false; cancelAnimationFrame(raf); raf = 0; fill.style.width = "0"; onDone(); }
+        else raf = requestAnimationFrame(tick);
+      };
+      const down = (e) => {
+        e.preventDefault();
+        active = true;
+        t0 = performance.now();
+        cancelAnimationFrame(raf);
+        raf = requestAnimationFrame(tick);
+      };
+      const up = () => { active = false; cancelAnimationFrame(raf); raf = 0; fill.style.width = "0"; };
+      el.addEventListener("pointerdown", down);
+      el.addEventListener("pointerup", up);
+      el.addEventListener("pointerleave", up);
+      el.addEventListener("pointercancel", up);
+      el.addEventListener("contextmenu", (e) => e.preventDefault());
+    }
+    function updateReachLine(el, d) {
+      if (!el) return;
+      const r = (d && d._reach) || {};
+      if (!r.enabled || !r.reachable) {
+        el.style.display = "none";
+        return;
+      }
+      el.style.display = "";
+      if (r.writing) {
+        const mb = r.size != null ? `${(Number(r.size) / 1e6).toFixed(1)} MB` : "-- MB";
+        const dur = r.recording_time != null ? fmtDur(r.recording_time) : "--:--";
+        const file = r.file_name || "raw log";
+        el.style.color = r.growing ? "var(--ok)" : "var(--warn)";
+        el.textContent = `Reach raw log: writing ${file}, ${mb}, ${dur}`;
+      } else if (r.writing === false) {
+        el.style.color = "var(--err)";
+        el.textContent = "Reach is NOT logging";
+      } else {
+        el.style.color = "var(--muted)";
+        el.textContent = "Reach raw log: waiting for status...";
+      }
     }
     function renderSurveyPill(d) {
       const sv = d._survey || {}, el = $("p-survey");
@@ -770,12 +808,54 @@
       if ($("sheet").classList.contains("open")) renderSheet(d);
     }
     function renderSheet(d) {
-      const sv = d._survey || {}, body = $("sv-body");
-      if (sdState) {
-        const st = d._shutdown || {};
-        body.innerHTML = `<div class="msgline">${esc(st.state === "powering_off" ? "Powering off" : st.state === "ready" ? "Ready to switch off" : "Shutting down safely...")}</div>` +
-          `<div class="conf">${(st.steps || []).map((x) => `<div class="${x.ok ? "y" : "n"}">${x.ok ? "✓" : "✗"} ${esc(x.step)}: ${esc(x.detail)}</div>`).join("")}</div>` +
-          `<div class="note">${esc(st.detail || "")}</div>`;
+      const sv = d._survey || {}, st = d._shutdown || {}, body = $("sv-body");
+      if (sdBusy || (st.state && st.state !== "running")) {
+        const steps = st.steps || [];
+        const fails = steps.filter((x) => x.severity === "fail");
+        const warns = steps.filter((x) => x.severity === "warn");
+        const allOk = st.all_ok !== undefined ? !!st.all_ok : fails.length === 0;
+        const phase = sdBusy && st.state !== "review" ? "preparing" : (st.state || "preparing");
+        const key = `sd:${sdBusy ? 1 : 0}:${phase}:${JSON.stringify(steps)}:${st.detail || ""}`;
+        if (body.dataset.key === key) return;
+        body.dataset.key = key;
+        $("sv-title").textContent = "SAFE SHUTDOWN";
+        const stepsHtml = `<div class="conf">${steps.map((x) => {
+          const cls = x.ok ? "y" : (x.severity === "warn" ? "w" : "n");
+          const mark = x.ok ? "✓" : "✗";
+          const bold = x.severity === "fail" ? "font-weight:800" : "";
+          return `<div class="${cls}" style="${bold}">${mark} ${esc(x.step)}: ${esc(x.detail)}</div>`;
+        }).join("")}</div>`;
+        if (sdBusy || phase === "preparing") {
+          body.innerHTML = `<div class="msgline">Preparing safe shutdown...</div>` + stepsHtml +
+            `<div class="note">Stopping any survey, syncing backups, parking the camera, and flushing data.</div>`;
+          return;
+        }
+        if (phase === "review") {
+          if (allOk) {
+            const headColor = warns.length ? "var(--warn)" : "var(--ok)";
+            const headText = warns.length ? "Ready to power off (check warnings below)" : "All checks passed. Ready to power off.";
+            body.innerHTML = `<div class="msgline" style="color:${headColor}">${esc(headText)}</div>` + stepsHtml +
+              `<button class="huge stop" id="sd-confirm"><div class="fill"></div><span>HOLD TO POWER OFF</span></button>` +
+              `<button class="huge ghost" id="sd-cancel"><span>CANCEL</span></button>`;
+            holdButton("sd-confirm", 2000, () => confirmShutdown(false));
+            $("sd-cancel").onclick = cancelShutdown;
+          } else {
+            const failList = fails.map((f) => `<div class="fnd blocker"><b>${esc(f.step)}</b><div class="ev">${esc(f.detail)}</div></div>`).join("");
+            body.innerHTML = `<div class="ready-box red">SHUTDOWN BLOCKED: ${fails.length} CHECK${fails.length === 1 ? "" : "S"} FAILED</div>` +
+              failList + stepsHtml +
+              `<button class="huge amber" id="sd-retry"><span>RETRY</span></button>` +
+              `<button class="huge stop" id="sd-override"><div class="fill"></div><span>HOLD 5 S TO SHUT DOWN ANYWAY</span></button>` +
+              `<button class="huge ghost" id="sd-cancel"><span>CANCEL</span></button>`;
+            $("sd-retry").onclick = shutdownPi;
+            holdButton("sd-override", 5000, () => confirmShutdown(true));
+            $("sd-cancel").onclick = cancelShutdown;
+          }
+          return;
+        }
+        body.innerHTML = `<div class="msgline">${esc(phase === "powering_off" ? "Powering off" : "Ready to switch off")}</div>` +
+          stepsHtml + `<div class="note">${esc(st.detail || "")}</div>` +
+          (phase === "ready" ? `<button class="huge ghost" id="sd-cancel"><span>DONE</span></button>` : "");
+        if ($("sd-cancel")) $("sd-cancel").onclick = cancelShutdown;
         return;
       }
       if (svPending) {
@@ -793,7 +873,7 @@
         const c = sv.current, x = c.since_start || {}, conf = c.confirmation;
         $("sv-title").textContent = c.name.toUpperCase();
         if (!$("sv-stop")) {
-          body.innerHTML = `<div class="elapsed" id="sv-el"></div><div class="msgline" id="sv-msg"></div><div class="conf" id="sv-conf"></div>` +
+          body.innerHTML = `<div class="elapsed" id="sv-el"></div><div class="msgline" id="sv-msg"></div><div class="msgline" id="sv-reach" style="display:none"></div><div class="conf" id="sv-conf"></div>` +
             `<div class="counts" id="sv-counts"></div>` +
             `<button class="huge stop" id="sv-stop"><div class="fill"></div><span>HOLD TO STOP SURVEY</span></button>`;
           holdButton("sv-stop", 1500, stopSurvey);
@@ -801,6 +881,7 @@
         $("sv-el").textContent = fmtDur(c.elapsed_s);
         $("sv-msg").textContent = sv.message || "";
         $("sv-msg").style.color = /NOT/.test(sv.message) ? "var(--err)" : (/Confirmed/.test(sv.message) ? "var(--ok)" : "var(--text)");
+        updateReachLine($("sv-reach"), d);
         $("sv-conf").innerHTML = (conf || []).map((i) => `<div class="${i.ok ? "y" : "n"}">${i.ok ? "✓" : "✗"} ${esc(i.item)}: ${esc(i.detail)}</div>`).join("");
         const cam = (d._camera || {}).enabled;
         $("sv-counts").innerHTML = [["LASER READINGS", (x.laser_readings || 0).toLocaleString()], ["WITH GROUND RETURN", (x.laser_valid || 0).toLocaleString()],
@@ -815,26 +896,50 @@
       }
       $("sv-title").textContent = "SURVEY";
       const L = sv.last;
-      const key = `idle:${L ? L.id : ""}:${sv.message}`;
-      if (body.dataset.key === key && $("sv-start")) return;      // don't wipe what she's typing
+      const reach = d._reach || {};
+      const reachAvail = !!(reach.enabled && reach.reachable);
+      const key = `idle:${L ? L.id : ""}:${sv.message}:${reachAvail ? 1 : 0}`;
+      if (body.dataset.key === key && $("sv-start")) {
+        if (reachAvail) updateReachLine($("sv-reach"), d);
+        return;      // don't wipe what she's typing or checkbox state
+      }
       body.dataset.key = key;
       const lastHtml = L ? `<div class="sect">LAST: ${esc(L.name)}</div><div class="msgline" style="color:${L.package && L.package.ok ? "var(--ok)" : "var(--err)"}">${esc(sv.message)}</div>` +
         `<div class="note">${fmtDur(L.duration_s)} · ${L.laser_readings.toLocaleString()} laser readings · ${L.gnss_fixes.toLocaleString()} fixes` +
         `${L.exposures ? " · " + L.exposures.toLocaleString() + " exposures" : ""} · ${L.readings_lost} lost<br>${esc((L.package && L.package.dir) || "")}</div>` : "";
+      const reachHtml = reachAvail
+        ? `<div class="msgline" id="sv-reach"></div>`
+        : `<label id="sv-reach-lbl" style="display:flex;align-items:center;gap:10px;padding:10px;border-radius:8px;background:var(--panel);border:1px solid var(--border);font-size:0.9rem;cursor:pointer">` +
+          `<input type="checkbox" id="sv-reach-ok" style="width:22px;height:22px;accent-color:var(--ok)" />` +
+          `<span>Reach raw logging is on (checked in Emlid Flow)</span></label>`;
       body.innerHTML = `<div class="note">The Pi records whenever the instruments are on. START marks the survey, starts the camera if it is under Pi control, and confirms every instrument is recording. STOP saves a verified copy to every backup drive.</div>` +
+        reachHtml +
         `<input id="sv-name" placeholder="Name (optional), e.g. Leg 3 ice shelf" style="background:var(--panel);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:12px;font:inherit;font-size:16px" />` +
         `<button class="huge go" id="sv-start"><span>START SURVEY</span></button>` + lastHtml +
         `<div class="sect">POWER</div><button class="huge ghost" id="sv-off"><div class="fill"></div><span>HOLD TO SHUT DOWN SAFELY</span></button>` +
         `<div class="note">Stops any survey, parks the camera's card, saves everything, then powers off the Pi. Switch the power off when its green LED stops.</div>`;
+      if (reachAvail) {
+        updateReachLine($("sv-reach"), d);
+      } else {
+        $("sv-start").disabled = true;
+        $("sv-reach-ok").onchange = () => { $("sv-start").disabled = !$("sv-reach-ok").checked; };
+      }
       $("sv-start").onclick = () => startSurvey(false);
       holdButton("sv-off", 2000, shutdownPi);
     }
     async function startSurvey(force) {
+      const reach = (last && last._reach) || {};
+      const reachAvail = !!(reach.enabled && reach.reachable);
+      const chk = $("sv-reach-ok");
+      const reachConfirmed = chk ? !!chk.checked : !!(svPending && svPending.reachConfirmed);
+      if (!reachAvail && !reachConfirmed) return;
       svBusy = true;
       const name = ($("sv-name") || {}).value || (svPending && svPending.name) || "";
-      const r = await (await fetch("/api/survey/start", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name, force }) })).json();
+      const reqBody = { name, force };
+      if (reachConfirmed) reqBody.reach_confirmed = true;
+      const r = await (await fetch("/api/survey/start", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(reqBody) })).json();
       svBusy = false;
-      svPending = r.needs_confirmation ? { readiness: r.readiness, name } : null;
+      svPending = r.needs_confirmation ? { readiness: r.readiness, name, reachConfirmed } : null;
       $("sv-body").innerHTML = ""; $("sv-body").dataset.key = "";
       renderSheet(last || {});
     }
@@ -844,8 +949,39 @@
       svBusy = false; $("sv-body").innerHTML = ""; $("sv-body").dataset.key = "";
     }
     async function shutdownPi() {
-      sdState = "running"; renderSheet(last || {});
-      await fetch("/api/shutdown", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ confirm: "SHUTDOWN" }) });
+      sdBusy = true; $("sv-body").dataset.key = ""; renderSheet(last || {});
+      try {
+        const r = await fetch("/api/shutdown/prepare", { method: "POST" });
+        const data = await r.json();
+        if (last) last._shutdown = data;
+      } finally {
+        sdBusy = false; $("sv-body").dataset.key = ""; renderSheet(last || {});
+      }
+    }
+    async function confirmShutdown(override) {
+      sdBusy = true; $("sv-body").dataset.key = ""; renderSheet(last || {});
+      try {
+        const r = await fetch("/api/shutdown/confirm", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ confirm: "SHUTDOWN", override: !!override }),
+        });
+        const data = await r.json();
+        if (last) {
+          last._shutdown = r.ok ? data : { ...(last._shutdown || {}), state: "review", steps: data.steps || (last._shutdown || {}).steps || [], all_ok: false, detail: data.error || "" };
+        }
+      } finally {
+        sdBusy = false; $("sv-body").dataset.key = ""; renderSheet(last || {});
+      }
+    }
+    async function cancelShutdown() {
+      sdBusy = false;
+      try {
+        const r = await fetch("/api/shutdown/cancel", { method: "POST" });
+        const data = await r.json();
+        if (last) last._shutdown = data;
+      } catch {}
+      $("sv-body").dataset.key = ""; renderSheet(last || {});
     }
     $("p-survey").onclick = () => { $("sheet").classList.add("open"); $("sv-body").innerHTML = ""; $("sv-body").dataset.key = ""; renderSheet(last || {}); };
     $("sv-close").onclick = () => { $("sheet").classList.remove("open"); svPending = null; };

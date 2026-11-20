@@ -37,6 +37,7 @@ import camera as camera_mod  # noqa: E402
 import diagnose  # noqa: E402
 import ppsclock  # noqa: E402
 import rawlog  # noqa: E402
+import reach as reach_mod  # noqa: E402
 import survey as survey_mod  # noqa: E402
 from supervise import Supervisor, watchdog  # noqa: E402
 
@@ -163,6 +164,17 @@ def section_enabled(cfg: dict, section: str) -> bool:
     return bool(c) and c.get("enabled", True) and str(c.get("port", "")).lower() not in ("", "none")
 
 
+def mount_point(path) -> Path:
+    """The mount point of the filesystem `path` is (or would be) on."""
+    p = Path(path)
+    while not p.exists() and p != p.parent:
+        p = p.parent
+    p = p.resolve()
+    while not os.path.ismount(p) and p != p.parent:
+        p = p.parent
+    return p
+
+
 def _unescape(s: str) -> bytes:
     """Config strings like 'd\\r\\n' -> bytes."""
     return s.encode("utf-8").decode("unicode_escape").encode("latin-1") if s else b""
@@ -247,6 +259,8 @@ class AeroLabDaemon:
         self.pps = ppsclock.PPSClock(tcfg.get("pps_device") if not sim_mode else None,
                                      on_edge=lambda seq, a, off: self.readings.add(
                                          "pps", (self.state.flight_id, seq, a, a - off, off)))
+        reach_url = str((cfg.get("gnss") or {}).get("reach_url") or "").strip()
+        self.reach = reach_mod.ReachLog(reach_url, sim=sim_mode)
         self._data_errors: dict[str, float] = {}
 
         try:
@@ -353,46 +367,172 @@ class AeroLabDaemon:
         for w in self.raw.values():
             w.sync()
 
-    async def shutdown(self, dry_run: bool = False) -> dict:
-        """Safe power-off: stop any survey, park the camera's card, flush, then power off the Pi."""
-        steps = []
-        self.shutdown_state = {"state": "stopping", "steps": steps}
+    async def shutdown_prepare(self) -> dict:
+        """Phase 1 of safe shutdown: stop any survey, final sync to mirrors, park camera, flush."""
+        steps: list[dict] = []
+        self.shutdown_state = {"state": "preparing", "steps": steps, "all_ok": False}
         if self.survey.state == "recording":
             r = await self.survey.stop()
-            steps.append({"step": "Stop survey", "ok": r.get("ok", False), "detail": self.survey.message})
+            pkg = (r.get("summary") or {}).get("package") or {}
+            copies = pkg.get("copies") or []
+            ok = bool(r.get("ok", False)) and pkg.get("ok", True) and all(c.get("verified") for c in copies)
+            steps.append({
+                "step": "Stop survey",
+                "ok": ok,
+                "detail": self.survey.message or r.get("error", ""),
+                "severity": "ok" if ok else "fail",
+            })
+        with contextlib.suppress(Exception):
+            await self.flush_all()
+        usable, missing = self.usable_mirrors()
+        sync_steps = [{"step": f"Final sync ({m})", "ok": False, "severity": "fail",
+                       "detail": f"backup drive not mounted at {mount_point(m) if mount_point(m) != Path('/') else m}: "
+                                 "plug it in (nothing was written, so nothing landed on the SD card)"} for m in missing]
+        if usable or not missing:
+            sync_steps += await asyncio.to_thread(survey_mod.final_sync, self.db_path, self.log_dir, usable)
+        steps.extend(sync_steps)
         cam = self.camera
-        if cam.enabled and cam.status_url and not self.sim_mode:
-            base = cam.status_url.rsplit("/status", 1)[0]
-            ok, detail = False, ""
-            try:
-                import httpx
-                async with httpx.AsyncClient(timeout=3.0) as client:
-                    await client.post(f"{base}/powerdownready", json={"power_down": True})
-                    for _ in range(30):
-                        r = (await client.get(f"{base}/powerdownready")).json()
-                        if r.get("ready_for_power_down"):
-                            ok = True
-                            break
-                        await asyncio.sleep(1.0)
-                detail = "camera storage unmounted, safe to cut its power" if ok else "camera did not confirm in 30 s"
-            except Exception as exc:
-                detail = f"camera not reachable ({exc}); hold its button 5 s before cutting power"
-            steps.append({"step": "Camera ready for power-off", "ok": ok, "detail": detail})
-        await self.flush_all()
-        steps.append({"step": "Flush data to disk", "ok": True, "detail": f"{self.readings.written} readings saved"})
-        self.buddy.emit("info", "Shutting down safely")
+        cc = self.cfg.get("camera") or {}
+        if cam.enabled:
+            if not cam.status_url or not cc.get("control_capture"):
+                steps.append({
+                    "step": "Camera ready for power-off",
+                    "ok": False,
+                    "detail": "camera not configured for Pi control; hold its button 5 s before cutting power",
+                    "severity": "warn",
+                })
+            elif self.sim_mode:
+                steps.append({
+                    "step": "Camera ready for power-off",
+                    "ok": True,
+                    "detail": "simulated: camera storage unmounted",
+                    "severity": "ok",
+                })
+            else:
+                base = cam.status_url.rsplit("/status", 1)[0]
+                ok, detail = False, ""
+                try:
+                    import httpx
+                    async with httpx.AsyncClient(timeout=3.0) as client:
+                        await client.post(f"{base}/powerdownready", json={"power_down": True})
+                        for _ in range(30):
+                            r = (await client.get(f"{base}/powerdownready")).json()
+                            if r.get("ready_for_power_down"):
+                                ok = True
+                                break
+                            await asyncio.sleep(1.0)
+                    detail = ("camera storage unmounted, safe to cut its power" if ok
+                              else "camera did not confirm in 30 s")
+                except Exception as exc:
+                    detail = f"camera not reachable ({exc}); hold its button 5 s before cutting power"
+                steps.append({
+                    "step": "Camera ready for power-off",
+                    "ok": ok,
+                    "detail": detail,
+                    "severity": "ok" if ok else "fail",
+                })
+        rst = self.reach.status()
+        if self.reach.sim:
+            steps.append({
+                "step": "Reach raw log",
+                "ok": True,
+                "detail": "simulated: Reach raw log stopped",
+                "severity": "ok",
+            })
+        elif rst.get("writing"):
+            steps.append({
+                "step": "Reach raw log",
+                "ok": False,
+                "detail": ("Reach is still logging: stop the log in Emlid Flow (or let Autostart's shutdown finish) "
+                           "before cutting the Reach's power; Emlid advises this so the log is compressed and complete"),
+                "severity": "warn",
+            })
+        elif rst.get("enabled") and rst.get("reachable") and rst.get("writing") is False:
+            steps.append({
+                "step": "Reach raw log",
+                "ok": True,
+                "detail": "Reach is not logging",
+                "severity": "ok",
+            })
+        try:
+            await self.flush_all()
+            steps.append({
+                "step": "Flush data to disk",
+                "ok": True,
+                "detail": f"{self.readings.written} readings saved",
+                "severity": "ok",
+            })
+        except Exception as exc:
+            steps.append({
+                "step": "Flush data to disk",
+                "ok": False,
+                "detail": f"flush failed: {exc}",
+                "severity": "fail",
+            })
+        all_ok = not any(s.get("severity") == "fail" for s in steps)
+        self.shutdown_state = {"state": "review", "steps": steps, "all_ok": all_ok}
+        return self.shutdown_state
+
+    async def shutdown_confirm(self, override: bool = False, dry_run: bool = False) -> tuple[int, dict]:
+        """Phase 2 of safe shutdown: refuse on failed checks unless override is true, then power off."""
+        if self.shutdown_state.get("state") != "review":
+            return 409, {
+                "error": "run shutdown prepare before confirming",
+                "state": self.shutdown_state.get("state", "running"),
+                "steps": list(self.shutdown_state.get("steps") or []),
+                "failing_steps": [],
+            }
+        steps = list(self.shutdown_state.get("steps") or [])
+        failing = [s for s in steps if s.get("severity") == "fail"]
+        if failing and not override:
+            return 409, {
+                "error": "shutdown blocked by failed checks",
+                "state": "review",
+                "steps": steps,
+                "failing_steps": failing,
+                "all_ok": False,
+            }
+        if failing and override:
+            summary = "; ".join(f"{s['step']}: {s['detail']}" for s in failing)
+            self.buddy.emit("alert", f"Shutdown forced over: {summary}")
+        else:
+            self.buddy.emit("info", "Shutting down safely")
+        all_ok = not failing
         if dry_run or self.sim_mode:
-            self.shutdown_state = {"state": "ready", "steps": steps, "detail": "simulation: the Pi stays on"}
-            return self.shutdown_state
-        self.shutdown_state = {"state": "powering_off", "steps": steps,
-                               "detail": "the Pi powers off in a few seconds; wait for the green LED to stop"}
+            self.shutdown_state = {
+                "state": "ready",
+                "steps": steps,
+                "all_ok": all_ok,
+                "overridden": bool(failing and override),
+                "detail": "simulation: the Pi stays on",
+            }
+            return 200, self.shutdown_state
+        self.shutdown_state = {
+            "state": "powering_off",
+            "steps": steps,
+            "all_ok": all_ok,
+            "overridden": bool(failing and override),
+            "detail": "the Pi powers off in a few seconds; wait for the green LED to stop",
+        }
 
         async def _off():
             await asyncio.sleep(2.0)
             proc = await asyncio.create_subprocess_exec("sudo", "-n", "/usr/bin/systemctl", "poweroff")
             await proc.wait()
+
         asyncio.create_task(_off())
+        return 200, self.shutdown_state
+
+    def shutdown_cancel(self) -> dict:
+        """Reset shutdown state back to running without restarting a stopped survey."""
+        self.shutdown_state = {"state": "running"}
         return self.shutdown_state
+
+    async def shutdown(self, dry_run: bool = False) -> dict:
+        """Backwards-compatible one-shot safe shutdown: prepare, then confirm without override."""
+        await self.shutdown_prepare()
+        _, res = await self.shutdown_confirm(override=False, dry_run=dry_run)
+        return res
 
     def _data_error(self, msg: str):
         """A write failed somewhere. Say so loudly, but at most once a minute per message."""
@@ -403,8 +543,18 @@ class AeroLabDaemon:
             self._data_errors[key] = now
             self.buddy.emit("alert", f"Data write problem: {msg}")
 
+    def usable_mirrors(self) -> tuple[list[Path], list[Path]]:
+        """(usable, not usable) backup folders. A backup folder counts only when the drive it lives on
+        is really mounted: an unplugged USB drive would otherwise mean writing "backups" onto the SD card."""
+        ok, bad = [], []
+        for m in self.mirror_dirs:
+            if m == self.log_dir:
+                continue
+            (ok if mount_point(m) != Path("/") else bad).append(m)
+        return ok, bad
+
     def log_dirs(self) -> list[Path]:
-        return [self.log_dir] + [d for d in self.mirror_dirs if d != self.log_dir]
+        return [self.log_dir] + self.usable_mirrors()[0]
 
     def recheck_log_dir(self) -> bool:
         """After a write error: is the SSD gone (or back)? Move logging to wherever works. True if moved."""
@@ -942,6 +1092,27 @@ class AeroLabDaemon:
         if self.pps.enabled:
             st = self.pps.status()
             items.append({"item": "GNSS PPS timing", "status": "ok" if st["ok"] else "warn", "detail": st["detail"]})
+        rst = self.reach.status()
+        if not rst["enabled"]:
+            items.append({"item": "Reach raw log", "status": "warn",
+                          "detail": "not configured: confirm in Emlid Flow"})
+        elif not rst["reachable"]:
+            err = f" ({rst['error']})" if rst.get("error") else ""
+            items.append({"item": "Reach raw log", "status": "warn",
+                          "detail": f"not reachable at {self.reach.url}{err}: confirm in Emlid Flow"})
+        elif rst["writing"] and rst["growing"]:
+            mb = (rst["size"] or 0) / 1e6
+            items.append({"item": "Reach raw log", "status": "ok",
+                          "detail": f"writing {rst['file_name'] or 'raw log'} ({mb:.1f} MB)"})
+        elif rst["writing"]:
+            items.append({"item": "Reach raw log", "status": "warn",
+                          "detail": f"writing {rst['file_name'] or 'raw log'}, waiting for size to grow"})
+        elif rst["writing"] is False:
+            items.append({"item": "Reach raw log", "status": "warn",
+                          "detail": "Reach is NOT logging raw data (enable Autostart in Emlid Flow)"})
+        else:
+            items.append({"item": "Reach raw log", "status": "warn",
+                          "detail": "connected, waiting for active_logs status"})
         items.append({"item": "Calibration", "status": "ok" if self.cal.updated else "warn",
                       "detail": f"ground calibration from {self.cal.updated}" if self.cal.updated
                       else "not calibrated: run Calibrate in Buddy before the first flight"})
@@ -1125,6 +1296,7 @@ table{{border-collapse:collapse;width:100%}}td,th{{border-bottom:1px solid #eee;
         d["_data"] = self.data_status()
         d["_ready"] = self.ready
         d["_camera"] = self.camera.snapshot()
+        d["_reach"] = self.reach.status()
         d["_survey"] = self.survey.status()
         d["_shutdown"] = self.shutdown_state
         return json.dumps(d)
@@ -1181,6 +1353,7 @@ table{{border-collapse:collapse;width:100%}}td,th{{border-bottom:1px solid #eee;
             *( [sup.run("camera", self.camera.sim_loop)] if self.camera.enabled and self.sim_mode else [] ),
             *( [sup.run("camera status", self.camera.status_loop)]
                if self.camera.enabled and self.camera.status_url and not self.sim_mode else [] ),
+            *( [sup.run("reach log", self.reach.run)] if self.reach.enabled else [] ),
             sup.run("buddy", self.buddy_loop, stall_s=60),
             sup.run("broadcast", self.broadcast_loop, stall_s=30),
             asyncio.create_task(self.run_bit()),
@@ -1249,11 +1422,37 @@ def create_app(daemon: AeroLabDaemon) -> FastAPI:
             body = await request.json()
         except Exception:
             body = {}
-        return JSONResponse(await daemon.survey.start(str(body.get("name", ""))[:60], bool(body.get("force"))))
+        return JSONResponse(await daemon.survey.start(
+            str(body.get("name", ""))[:60],
+            bool(body.get("force")),
+            reach_confirmed=bool(body.get("reach_confirmed")),
+        ))
 
     @app.post("/api/survey/stop")
     async def survey_stop():
         return JSONResponse(await daemon.survey.stop(), headers={"cache-control": "no-store"})
+
+    @app.post("/api/shutdown/prepare")
+    async def shutdown_prepare():
+        return JSONResponse(await daemon.shutdown_prepare())
+
+    @app.post("/api/shutdown/confirm")
+    async def shutdown_confirm(request: Request):
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if body.get("confirm") != "SHUTDOWN":
+            return JSONResponse({"error": "send {\"confirm\": \"SHUTDOWN\"}"}, status_code=400)
+        code, res = await daemon.shutdown_confirm(
+            override=bool(body.get("override")),
+            dry_run=bool(body.get("dry_run")),
+        )
+        return JSONResponse(res, status_code=code)
+
+    @app.post("/api/shutdown/cancel")
+    async def shutdown_cancel():
+        return JSONResponse(daemon.shutdown_cancel())
 
     @app.post("/api/shutdown")
     async def shutdown(request: Request):
@@ -1263,7 +1462,9 @@ def create_app(daemon: AeroLabDaemon) -> FastAPI:
             body = {}
         if body.get("confirm") != "SHUTDOWN":
             return JSONResponse({"error": "send {\"confirm\": \"SHUTDOWN\"}"}, status_code=400)
-        return JSONResponse(await daemon.shutdown(dry_run=bool(body.get("dry_run"))))
+        await daemon.shutdown_prepare()
+        code, res = await daemon.shutdown_confirm(override=False, dry_run=bool(body.get("dry_run")))
+        return JSONResponse(res, status_code=code)
 
     @app.get("/api/bench/laser")
     async def bench_laser(seconds: float = 10.0, distance_m: float | None = None):

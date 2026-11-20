@@ -192,6 +192,8 @@ def build_config(base: dict, answers: dict, catalog: dict | None = None) -> dict
             cfg[key]["port"] = answers[f"{key}.port"]
         if f"{key}.baud" in answers:
             cfg[key]["baud"] = int(answers[f"{key}.baud"])
+    if "gnss.reach_url" in answers:
+        cfg["gnss"]["reach_url"] = str(answers["gnss.reach_url"]).strip()
     if "laser.unit" in answers:
         cfg["laser_altimeter"]["unit"] = answers["laser.unit"]
     if "laser.offset" in answers:
@@ -500,6 +502,12 @@ def interview(ui, base: dict, catalog: dict | None = None) -> tuple[dict, dict]:
     # Devices
     gnss = ask_device(ui, "GNSS receiver or GNSS/INS:", catalog["gnss"], a["gnss.device"])
     a["gnss.device"] = gnss["id"]
+    if gnss["id"].startswith("emlid-reach"):
+        cur_reach_url = str((base.get("gnss") or {}).get("reach_url") or "")
+        a["gnss.reach_url"] = ui.text(
+            "Reach address on the network for checking its raw log (e.g. http://192.168.42.1; empty to skip)",
+            cur_reach_url,
+        ).strip()
     att_default = "from-gnss" if gnss.get("provides_attitude") else (
         a["attitude.device"] if a["attitude.device"] != "from-gnss" else "none-post")
     att = ask_device(ui, "Attitude source (roll, pitch, heading):", catalog["attitude"], att_default)

@@ -67,6 +67,11 @@ def findings(d, catalog: dict | None = None) -> list[dict]:
         if w["errors"]:
             add("warn", f"Raw capture for {sec} had {w['errors']} write errors", ", ".join(w["dirs"]),
                 ["Check each log directory is mounted and writable.", "A failing USB stick or SSD shows up here first."])
+    usable, missing = d.usable_mirrors()
+    for m in missing:
+        add("warn", f"Backup drive not mounted: {m}", "it is on the SD card's filesystem, so nothing is written there",
+            ["Plug in the backup drive and check it mounts (`lsblk`, `/etc/fstab` with `nofail`).",
+             "Until it does, there is one copy of the data, on the log disk."])
     if d.fallback_logging and not s.sim_mode:
         add("warn", "Logging to the SD card, not the SSD", f"log dir {d.log_dir}",
             ["Plug in the SSD and check it mounts at the configured path (`/etc/fstab` with `nofail`).",
@@ -143,6 +148,28 @@ def findings(d, catalog: dict | None = None) -> list[dict]:
             ["Every reading is also stamped with the monotonic clock and GNSS epoch time, so "
              "tools/export_laser.py still puts it on GNSS time. Nothing is lost.",
              "To fix the clock itself: connect to the internet once, or fit the Pi 5 RTC battery."])
+
+    # ---- Reach raw log
+    reach = getattr(d, "reach", None)
+    if reach is not None and reach.enabled:
+        rst = reach.status()
+        if rst.get("reachable"):
+            if rst.get("writing") is False:
+                sv = getattr(d, "survey", None)
+                recording = sv is not None and getattr(sv, "state", "") == "recording"
+                add("blocker" if recording else "warn",
+                    "Reach raw log is not recording",
+                    f"Reach at {reach.url} reports is_writing false" if reach.url else "Reach reports is_writing false",
+                    ["Turn on Autostart in Emlid Flow: Receivers > Logging > Recorded logs and settings > gear > Autostart.",
+                     "Check free storage on the Reach; a full memory stops logging.",
+                     "Check the receiver is not in base mode."])
+        elif reach.url:
+            add("info",
+                "Reach raw log status not reachable",
+                f"{reach.url}" + (f" ({rst['error']})" if rst.get("error") else ""),
+                ["Check the Pi and the Reach are on the same network (or connected to the Reach hotspot).",
+                 "Check the Reach IP address in config (gnss.reach_url) matches the receiver.",
+                 f"Confirm Reach Panel opens in a browser at {reach.url}."])
 
     # ---- camera that captures on its own
     cam = getattr(d, "camera", None)
