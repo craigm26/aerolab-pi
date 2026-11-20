@@ -1,0 +1,48 @@
+# Next steps before hardware testing
+
+Planned work for the snow-survey installation, in order. Nothing here is built yet; decisions still open are marked **Decision**.
+
+## 1. Readiness check: is the Reach M2's own raw log running?
+
+Emlid doesn't document a way to ask the Reach whether it is logging. Emlid Flow talks to the Reach over a private local API that can change between firmware versions. So, in three layers:
+
+1. **Research.** Look for a stable, known way to read the logging status from the Reach on the local network.
+2. **Discovery tool.** `tools/reach_discover.py` asks the Reach a short list of status questions over the local network, read-only, and saves the answers. Run it on the bench with the Reach on the Pi's network, so support is built against the real firmware rather than a guess.
+3. **Fallback that always works.** START SURVEY gets a required tick: "Reach raw logging confirmed in Emlid Flow". It is recorded with the survey. If step 2 finds a usable status, the tick becomes an automatic check, and the manual tick stays as a backup.
+
+## 2. Shutdown blocks on problems
+
+Shutdown becomes two phases:
+
+- **Prepare:**
+  1. Stop any survey.
+  2. Copy the latest flight database and raw captures to every backup drive and verify them. This happens even with no survey running, so transit legs are covered.
+  3. Ask the camera to park its card, and wait for it to confirm.
+- **Review:** if everything passed, hold to power off. If anything failed, it stops and names the failure, for example "Backup to /mnt/usb2 failed: not mounted" or "Camera did not confirm its card is parked". Options: Retry, Shut down anyway (a longer hold, logged), or Cancel.
+
+## 3. Camera images
+
+The RedEdge-P keeps its images on its own card, and they are backed up separately.
+
+- **(a) Image list** (planned): at STOP, the Pi saves the camera's file list (name, size, time, via the documented `/files` API) into the survey package. A check tool compares a separate backup of the card against that list, so a missing or truncated image shows up.
+- **(b) Image copy** (optional, **Decision**): after landing, on ground power, copy the images to the Pi's SSD over Ethernet. They are large, so this is slow, and it must never run in flight.
+
+## 4. Install test before the first real install
+
+`install.sh` changes system settings (serial console, sudoers, udev, boot overlays) and hasn't yet run on a clean Raspberry Pi OS image. **Decision:**
+- **Full test:** run the whole install plus the simulator on a freshly flashed spare Pi 5 / SD card;
+- **Without a spare:** add `./install.sh --dry-run`, which prints every system change without making it, plus a shell-script lint, and treat the first bench install as the test.
+
+## 5. First bench session
+
+Follow [bench-checklist.md](bench-checklist.md) in this order:
+1. **Laser serial link:** adapter loopback, Souriau pins, probe, tape-measure check.
+2. **Reach M2:** NMEA output, raw logging set to start on power-up.
+3. **PPS timing:** `tools/timing_check.py`.
+4. **Camera exposures:** wiring test, then Reach time marks against the Pi's exposure list.
+5. **Ground calibration.**
+6. **A 5-minute survey dry run.**
+
+Send the `./bench.sh` report files and the timing check.
+
+At 450 ft the ILM-150-R is near its rated range (137 m of 150 m), so watch the no-return rate on the first flights.

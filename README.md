@@ -180,7 +180,7 @@ The camera's images stay on its own card.
 
 ## Bench tools for the installation
 
-Run these on the bench to prove each connection, in order. Full steps are in [docs/bench-checklist.md](docs/bench-checklist.md).
+Run these on the bench to prove each connection, in order. Full steps are in [docs/bench-checklist.md](docs/bench-checklist.md); planned work before hardware testing is in [docs/next-steps.md](docs/next-steps.md).
 
 | Tool | Proves |
 |---|---|
